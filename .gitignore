@@ -18,3 +18,7 @@ __pycache__/
 
 # Unusual key filename
 claukey,key
+# Env files
+.env
+.env.*
+!.env.example
