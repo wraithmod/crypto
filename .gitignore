@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# Secrets
+*.key
+
+# Logs
+*.log
+
+# Editor
+.vscode/
+
+# Local AI/agent settings
+.claude/
+
+# Unusual key filename
+claukey,key
