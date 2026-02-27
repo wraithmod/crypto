@@ -144,9 +144,9 @@ class TestGetAvgSentiment:
     def test_avg_sentiment_with_scored_items(self):
         feed = _make_feed()
         feed._latest = [
-            NewsItem("A", "", "", "", SentimentResult(0.6, "bullish", "")),
-            NewsItem("B", "", "", "", SentimentResult(-0.4, "bearish", "")),
-            NewsItem("C", "", "", "", SentimentResult(0.2, "neutral", "")),
+            NewsItem("A", "", "", "", sentiment=SentimentResult(0.6, "bullish", "")),
+            NewsItem("B", "", "", "", sentiment=SentimentResult(-0.4, "bearish", "")),
+            NewsItem("C", "", "", "", sentiment=SentimentResult(0.2, "neutral", "")),
         ]
         expected = (0.6 + (-0.4) + 0.2) / 3
         assert feed.get_avg_sentiment() == pytest.approx(expected)
@@ -154,8 +154,8 @@ class TestGetAvgSentiment:
     def test_avg_sentiment_ignores_items_without_sentiment(self):
         feed = _make_feed()
         feed._latest = [
-            NewsItem("A", "", "", "", SentimentResult(0.8, "bullish", "")),
-            NewsItem("B", "", "", "", None),  # no sentiment
+            NewsItem("A", "", "", "", sentiment=SentimentResult(0.8, "bullish", "")),
+            NewsItem("B", "", "", ""),   # no sentiment
         ]
         assert feed.get_avg_sentiment() == pytest.approx(0.8)
 
@@ -225,11 +225,11 @@ class TestFetchHeadlinesMocked:
         assert "Valid headline" in titles
 
     @pytest.mark.asyncio
-    async def test_fetch_headlines_limits_to_twenty(self):
-        """At most 20 items are returned regardless of feed size."""
+    async def test_fetch_headlines_limits_to_thirty(self):
+        """At most 30 items are returned regardless of feed size."""
         entries = [
             {"title": f"Headline {i}", "link": f"https://ex.com/{i}", "published": ""}
-            for i in range(30)
+            for i in range(40)
         ]
         fake_result = _fake_feedparser_result(entries)
 
@@ -237,7 +237,7 @@ class TestFetchHeadlinesMocked:
             feed = _make_feed()
             items = await feed.fetch_headlines()
 
-        assert len(items) <= 20
+        assert len(items) <= 30
 
     @pytest.mark.asyncio
     async def test_fetch_headlines_handles_feedparser_exception(self):

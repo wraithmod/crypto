@@ -1,13 +1,10 @@
 """
 Live console dashboard for the crypto trading platform.
 
-Renders a 5-panel rich Layout that refreshes in-place without scrolling:
-  - Header  : platform title and current timestamp
-  - Prices  : live bid/ask/price per tracked symbol
-  - Portfolio: holdings with current value
-  - P&L     : realized, unrealized, total
-  - Strategy: active strategy and last trade action
-  - News    : recent headlines with sentiment labels
+Renders a 3-region rich Layout that refreshes in-place without scrolling:
+  - Header    : platform title and current timestamp
+  - Main row  : live crypto prices | portfolio holdings | P&L summary
+  - Markets   : global indices (left) | ASX stocks (right)
 
 Expected dependency interfaces (injected at runtime):
 
@@ -23,17 +20,6 @@ Expected dependency interfaces (injected at runtime):
         portfolio.get_unrealized_pnl(prices: dict[str, float]) -> float
         portfolio.get_realized_pnl() -> float
         portfolio.get_total_value(prices: dict[str, float]) -> float
-
-    NewsFeed
-        news_feed.get_latest() -> list[NewsItem]
-            NewsItem.title, .source
-            NewsItem.sentiment: SentimentResult | None
-                SentimentResult.score: float   (-1 … +1 or 0 … 1)
-                SentimentResult.label: str     e.g. "bullish"/"neutral"/"bearish"
-
-    TradeEngine
-        engine.get_last_action() -> str
-        engine.get_active_strategy() -> str
 """
 
 from __future__ import annotations
@@ -43,7 +29,6 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from rich import box
-from rich.columns import Columns
 from rich.console import Console
 from rich.layout import Layout
 from rich.live import Live
@@ -58,21 +43,6 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
-
-_SENTIMENT_COLORS: dict[str, str] = {
-    "bullish": "green",
-    "positive": "green",
-    "neutral": "yellow",
-    "mixed": "yellow",
-    "bearish": "red",
-    "negative": "red",
-}
-
-
-def _sentiment_color(label: str) -> str:
-    """Return a rich color name for a sentiment label string."""
-    return _SENTIMENT_COLORS.get(label.lower(), "white")
-
 
 def _pnl_color(value: float) -> str:
     """Return green for positive, red for negative, white for zero."""
@@ -122,10 +92,8 @@ class Dashboard:
         """
         Build the LIVE PRICES table.
 
-        Columns: Symbol | Price | Bid | Ask | Volume | Change
-        A ▲ (green) or ▼ (red) indicator shows whether the price moved up
-        or down since the previous refresh.  On the first render the
-        direction indicator is omitted.
+        Columns: Symbol | Price | Dir
+        ▲/▼ shows whether price moved up or down since the previous refresh.
         """
         table = Table(
             title="[bold cyan]LIVE PRICES[/bold cyan]",
@@ -136,32 +104,18 @@ class Dashboard:
         )
         table.add_column("Symbol", style="bold", no_wrap=True)
         table.add_column("Price", justify="right")
-        table.add_column("Bid", justify="right", style="dim")
-        table.add_column("Ask", justify="right", style="dim")
-        table.add_column("Volume", justify="right", style="dim")
-        table.add_column("Dir", justify="center", no_wrap=True)
+        table.add_column("", justify="center", no_wrap=True, width=1)
 
         symbols: list[str] = getattr(market_feed, "symbols", []) or []
 
         for symbol in symbols:
             tick = market_feed.get_latest(symbol)
             if tick is None:
-                table.add_row(
-                    symbol,
-                    "[dim]—[/dim]",
-                    "[dim]—[/dim]",
-                    "[dim]—[/dim]",
-                    "[dim]—[/dim]",
-                    "[dim]?[/dim]",
-                )
+                table.add_row(symbol, "[dim]—[/dim]", Text("?", style="dim"))
                 continue
 
             price: float = float(tick.price)
-            bid: float = float(tick.bid) if tick.bid is not None else price
-            ask: float = float(tick.ask) if tick.ask is not None else price
-            volume: float = float(tick.volume) if tick.volume is not None else 0.0
 
-            # Direction indicator vs previous refresh
             prev = self._prev_prices.get(symbol)
             if prev is None:
                 direction = Text("•", style="dim")
@@ -172,26 +126,13 @@ class Dashboard:
             else:
                 direction = Text("=", style="dim")
 
-            # Price colour based on direction
+            price_color = "white"
             if prev is not None and price != prev:
                 price_color = "green" if price > prev else "red"
-            else:
-                price_color = "white"
-
-            # Volume formatting: show K / M suffixes for readability
-            if volume >= 1_000_000:
-                vol_str = f"{volume / 1_000_000:.2f}M"
-            elif volume >= 1_000:
-                vol_str = f"{volume / 1_000:.1f}K"
-            else:
-                vol_str = f"{volume:.4f}"
 
             table.add_row(
                 f"[bold]{symbol}[/bold]",
                 f"[{price_color}]{_fmt_price(price)}[/{price_color}]",
-                f"[dim]{_fmt_price(bid)}[/dim]",
-                f"[dim]{_fmt_price(ask)}[/dim]",
-                f"[dim]{vol_str}[/dim]",
                 direction,
             )
 
@@ -294,53 +235,29 @@ class Dashboard:
             expand=True,
         )
 
-    def _make_strategy_panel(self, engine: Any) -> Panel:
+    def _make_index_table(
+        self,
+        ticks: dict[str, Any],
+        title: str = "GLOBAL MARKETS",
+        currency_symbol: str = "",
+    ) -> Table:
         """
-        Build the STRATEGY panel.
+        Build a market table from a dict of IndexTick objects.
 
-        Displays the active strategy name and the most recent trade action
-        taken by the engine.
-        """
-        strategy: str = engine.get_active_strategy() or "[dim]None[/dim]"
-        last_action: str = engine.get_last_action() or "[dim]None[/dim]"
-
-        content = Text()
-        content.append("Strategy:    ", style="dim")
-        content.append(f"{strategy}\n", style="bold yellow")
-        content.append("Last Action: ", style="dim")
-        content.append(last_action, style="bold white")
-
-        return Panel(
-            content,
-            title="[bold cyan]STRATEGY[/bold cyan]",
-            border_style="cyan",
-            box=box.ROUNDED,
-            expand=True,
-        )
-
-    def _make_markets_table(self, indices_feed: Any) -> Table:
-        """
-        Build the GLOBAL MARKETS table.
-
-        Columns: Index | Value | Change | % Change
-        VIX is highlighted separately as a fear gauge.
-        Change columns are green for positive, red for negative.
+        Columns: Name | Value | Change | % Change
+        VIX is highlighted as a fear gauge (inverted colors).
         """
         table = Table(
-            title="[bold cyan]GLOBAL MARKETS[/bold cyan]",
+            title=f"[bold cyan]{title}[/bold cyan]",
             box=box.SIMPLE_HEAVY,
             show_header=True,
             header_style="bold magenta",
             expand=True,
         )
-        table.add_column("Index", style="bold", no_wrap=True, min_width=14)
-        table.add_column("Value", justify="right")
-        table.add_column("Change", justify="right")
-        table.add_column("% Change", justify="right")
-
-        ticks: dict[str, Any] = {}
-        if indices_feed is not None:
-            ticks = getattr(indices_feed, "get_all", lambda: {})()
+        table.add_column("Name", style="bold", no_wrap=True, min_width=6)
+        table.add_column("Price", justify="right")
+        table.add_column("Chg", justify="right")
+        table.add_column("%", justify="right")
 
         if not ticks:
             table.add_row("[dim]Fetching…[/dim]", "", "", "")
@@ -352,7 +269,6 @@ class Dashboard:
             change_pct: float = float(tick.change_pct)
             name: str = str(tick.name)
 
-            # VIX is a fear gauge — invert color logic (high VIX = red)
             if sym == "^VIX":
                 price_style = "bold red" if price > 20 else "bold green"
                 chg_color = "red" if change > 0 else "green"
@@ -361,60 +277,35 @@ class Dashboard:
                 chg_color = "green" if change >= 0 else "red"
 
             sign = "+" if change >= 0 else ""
+            pfx = currency_symbol
             table.add_row(
                 f"[bold]{name}[/bold]",
-                f"[{price_style}]{price:,.2f}[/{price_style}]",
+                f"[{price_style}]{pfx}{price:,.2f}[/{price_style}]",
                 f"[{chg_color}]{sign}{change:,.2f}[/{chg_color}]",
                 f"[{chg_color}]{sign}{change_pct:.2f}%[/{chg_color}]",
             )
 
         return table
 
-    def _make_news_panel(self, news_feed: Any) -> Panel:
-        """
-        Build the NEWS & SENTIMENT panel.
+    def _make_markets_table(self, indices_feed: Any) -> Table:
+        """Build the GLOBAL MARKETS table (backward-compat wrapper)."""
+        ticks: dict[str, Any] = {}
+        if indices_feed is not None:
+            get_by_group = getattr(indices_feed, "get_by_group", None)
+            if get_by_group:
+                ticks = get_by_group("global_markets")
+            else:
+                ticks = getattr(indices_feed, "get_all", lambda: {})()
+        return self._make_index_table(ticks, title="GLOBAL MARKETS")
 
-        Each item shows:
-            [LABEL score] Headline title — Source
-        Label colour: green=bullish, yellow=neutral, red=bearish.
-        Up to 8 items are displayed; older items are truncated.
-        """
-        items: list[Any] = news_feed.get_latest() or []
-
-        content = Text()
-
-        if not items:
-            content.append("No recent news available.", style="dim italic")
-        else:
-            # Show at most 8 headlines to avoid overflowing the panel
-            for item in items[:8]:
-                sentiment = item.sentiment
-
-                if sentiment is not None:
-                    label: str = str(sentiment.label).upper()
-                    score: float = float(sentiment.score)
-                    color = _sentiment_color(str(sentiment.label))
-                    badge = f"[{label} {score:+.2f}]"
-                    content.append(badge, style=f"bold {color}")
-                else:
-                    content.append("[UNSCORED]", style="dim")
-
-                # Truncate long titles so they fit on one line
-                title: str = str(item.title)
-                source: str = str(item.source) if item.source else "Unknown"
-                if len(title) > 55:
-                    title = title[:52] + "..."
-
-                content.append(f" {title}", style="white")
-                content.append(f" — {source}\n", style="dim")
-
-        return Panel(
-            content,
-            title="[bold cyan]NEWS & SENTIMENT[/bold cyan]",
-            border_style="cyan",
-            box=box.ROUNDED,
-            expand=True,
-        )
+    def _make_asx_table(self, indices_feed: Any) -> Table:
+        """Build the ASX STOCKS table."""
+        ticks: dict[str, Any] = {}
+        if indices_feed is not None:
+            get_by_group = getattr(indices_feed, "get_by_group", None)
+            if get_by_group:
+                ticks = get_by_group("asx_stocks")
+        return self._make_index_table(ticks, title="ASX STOCKS", currency_symbol="A$")
 
     # ------------------------------------------------------------------
     # Layout assembly
@@ -438,18 +329,15 @@ class Dashboard:
         self,
         market_feed: Any,
         portfolio: Any,
-        news_feed: Any,
-        engine: Any,
         indices_feed: Any = None,
     ) -> Layout:
         """
-        Assemble all panels into the full 6-region Layout:
+        Assemble all panels into the 3-region Layout:
 
-            ┌────────────────────── header ──────────────────────┐
-            │ crypto prices │    portfolio      │      p&l        │
-            ├────────────────── global markets ──────────────────┤
-            ├────────────────────── strategy ────────────────────┤
-            └────────────────────── news ─────────────────────────┘
+            ┌──────────────────────── header ─────────────────────────┐
+            │  crypto prices  │      portfolio       │      P&L        │
+            ├─────────────────── global markets ──────────────────────┤
+            └────────────────────── asx stocks ───────────────────────┘
         """
         # Collect current prices once; reused by portfolio and P&L panels.
         symbols: list[str] = getattr(market_feed, "symbols", []) or []
@@ -459,16 +347,17 @@ class Dashboard:
             if tick is not None:
                 prices[sym] = float(tick.price)
 
-        # Build individual panels/tables
+        # Build panels
         prices_table = self._make_prices_table(market_feed)
         portfolio_table = self._make_portfolio_table(portfolio, prices)
         pnl_panel = self._make_pnl_panel(portfolio, prices)
-        strategy_panel = self._make_strategy_panel(engine)
-        news_panel = self._make_news_panel(news_feed)
         header_panel = self._make_header()
         markets_table = self._make_markets_table(indices_feed)
+        asx_table = self._make_asx_table(indices_feed) if (
+            indices_feed is not None and getattr(indices_feed, "get_by_group", None)
+        ) else None
 
-        # Update internal price history after rendering prices table
+        # Update price history for direction arrows
         for sym, price in prices.items():
             self._prev_prices[sym] = price
 
@@ -477,51 +366,44 @@ class Dashboard:
         # ------------------------------------------------------------------
         layout = Layout()
 
-        # Split vertically: header / main / markets / strategy / news
         layout.split_column(
             Layout(name="header", size=3),
-            Layout(name="main", ratio=5),
-            Layout(name="markets", size=12),
-            Layout(name="strategy", size=4),
-            Layout(name="news", ratio=3),
+            Layout(name="main", ratio=7),
+            Layout(name="markets", size=14),
         )
 
         layout["header"].update(header_panel)
 
-        # Main row: crypto prices | portfolio | pnl  (ratios 3 : 5 : 2)
+        # Main row: prices (narrow) | portfolio (wide) | pnl (narrow)
         layout["main"].split_row(
-            Layout(name="prices", ratio=3),
+            Layout(name="prices", ratio=2),
             Layout(name="portfolio", ratio=5),
             Layout(name="pnl", ratio=2),
         )
         layout["main"]["prices"].update(
-            Panel(
-                prices_table,
-                border_style="blue",
-                box=box.ROUNDED,
-                padding=(0, 1),
-            )
+            Panel(prices_table, border_style="blue", box=box.ROUNDED, padding=(0, 1))
         )
         layout["main"]["portfolio"].update(
-            Panel(
-                portfolio_table,
-                border_style="blue",
-                box=box.ROUNDED,
-                padding=(0, 1),
-            )
+            Panel(portfolio_table, border_style="blue", box=box.ROUNDED, padding=(0, 1))
         )
         layout["main"]["pnl"].update(pnl_panel)
 
-        layout["markets"].update(
-            Panel(
-                markets_table,
-                border_style="magenta",
-                box=box.ROUNDED,
-                padding=(0, 1),
+        # Markets row: Global Markets | ASX Stocks side by side when ASX enabled
+        if asx_table is not None:
+            layout["markets"].split_row(
+                Layout(name="global_markets", ratio=2),
+                Layout(name="asx_stocks", ratio=3),
             )
-        )
-        layout["strategy"].update(strategy_panel)
-        layout["news"].update(news_panel)
+            layout["markets"]["global_markets"].update(
+                Panel(markets_table, border_style="magenta", box=box.ROUNDED, padding=(0, 1))
+            )
+            layout["markets"]["asx_stocks"].update(
+                Panel(asx_table, border_style="yellow", box=box.ROUNDED, padding=(0, 1))
+            )
+        else:
+            layout["markets"].update(
+                Panel(markets_table, border_style="magenta", box=box.ROUNDED, padding=(0, 1))
+            )
 
         return layout
 
@@ -568,7 +450,7 @@ class Dashboard:
         ) as live:
             while True:
                 layout = self._build_layout(
-                    market_feed, portfolio, news_feed, engine,
+                    market_feed, portfolio,
                     indices_feed=indices_feed,
                 )
                 live.update(layout)

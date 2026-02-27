@@ -14,15 +14,12 @@ from dataclasses import dataclass
 
 from config import AppConfig, config as default_config
 from src.portfolio.portfolio import Portfolio, Trade
-from src.prediction.predictor import Predictor, Signal
+from src.prediction.predictor import Predictor, Signal, Indicators
 from src.market.feed import MarketFeed, PriceTick
 from src.news.feed import NewsFeed
+from src.trading.risk import RiskProfile, MEDIUM
 
 logger = logging.getLogger(__name__)
-
-# Minimum signal confidence required before a trade is placed.
-# Uses strict less-than so confidence=0.5 (one triggered condition) passes.
-_CONFIDENCE_THRESHOLD: float = 0.45
 
 
 class TradeEngine:
@@ -41,10 +38,12 @@ class TradeEngine:
         portfolio: Portfolio,
         predictor: Predictor,
         config: AppConfig = default_config,
+        risk: RiskProfile = MEDIUM,
     ) -> None:
         self._portfolio: Portfolio = portfolio
         self._predictor: Predictor = predictor
         self._config: AppConfig = config
+        self._risk: RiskProfile = risk
         self._last_action: str = "No action yet"
 
     # ------------------------------------------------------------------
@@ -150,9 +149,12 @@ class TradeEngine:
             "symbol-specific" if symbol_sentiment is not None else "global-avg",
         )
 
-        # 3. Predictor signal
+        # 3. Predictor signal — pass candle history for momentum indicators
+        candle_history = market_feed.get_candle_history(symbol)
         signal: Signal = await self._predictor.get_signal(
-            symbol, price_history, news_sentiment
+            symbol, price_history, news_sentiment,
+            risk=self._risk,
+            candles=candle_history if candle_history else None,
         )
 
         logger.debug(
@@ -178,7 +180,7 @@ class TradeEngine:
             h = holdings_check[symbol]
             if h.avg_cost > 0:
                 pct_change = (current_price - h.avg_cost) / h.avg_cost
-                if pct_change <= -self._config.stop_loss_pct:
+                if pct_change <= -self._risk.stop_loss_pct:
                     logger.info(
                         "Pre-signal STOP-LOSS for %s: %.2f%% down from avg cost %.4f",
                         symbol, pct_change * 100, h.avg_cost,
@@ -190,11 +192,11 @@ class TradeEngine:
                     return
 
         # Gate on confidence
-        if signal.confidence < _CONFIDENCE_THRESHOLD:
+        if signal.confidence < self._risk.confidence_threshold:
             logger.debug(
-                "Signal confidence %.4f <= %.2f for %s — no trade",
+                "Signal confidence %.4f < %.2f for %s — no trade",
                 signal.confidence,
-                _CONFIDENCE_THRESHOLD,
+                self._risk.confidence_threshold,
                 symbol,
             )
             return
@@ -218,7 +220,7 @@ class TradeEngine:
             )
 
             max_position_value: float = (
-                self._config.max_position_fraction * total_value
+                self._risk.max_position_fraction * total_value
             )
 
             if position_value >= max_position_value:
@@ -231,7 +233,7 @@ class TradeEngine:
                 return
 
             # How much cash we're willing to deploy this trade
-            trade_cash: float = self._config.trade_fraction * cash
+            trade_cash: float = self._risk.trade_fraction * cash
 
             # Don't exceed the remaining allowed position room
             remaining_room: float = max_position_value - position_value
@@ -246,6 +248,12 @@ class TradeEngine:
                 return
 
             quantity: float = trade_cash / current_price
+            if quantity < 1e-8:
+                logger.debug(
+                    "evaluate_symbol: quantity %.2e too small for BUY %s — skipping",
+                    quantity, symbol,
+                )
+                return
 
             try:
                 await self.place_paper_trade(symbol, "buy", quantity, current_price)
@@ -274,13 +282,13 @@ class TradeEngine:
 
             avg_cost: float = holding.avg_cost
             price_change_pct: float = (current_price - avg_cost) / avg_cost if avg_cost > 0 else 0.0
-            stop_loss_threshold: float = -self._config.stop_loss_pct
+            stop_loss_threshold: float = -self._risk.stop_loss_pct
 
             # Stop-loss: always sell if down beyond the stop-loss threshold
             if price_change_pct <= stop_loss_threshold:
                 logger.info(
                     "STOP-LOSS triggered for %s: price_change=%.2f%% <= -%.2f%%",
-                    symbol, price_change_pct * 100, self._config.stop_loss_pct * 100,
+                    symbol, price_change_pct * 100, self._risk.stop_loss_pct * 100,
                 )
                 try:
                     await self.place_paper_trade(symbol, "sell", sell_quantity, current_price)
@@ -290,11 +298,31 @@ class TradeEngine:
 
             # Fee-aware gate: only sell on signal if profit exceeds round-trip fees + margin
             round_trip_fee = 2 * self._config.binance_fee_rate
-            min_required = round_trip_fee + self._config.min_profit_to_sell
+            min_required = round_trip_fee + self._risk.min_profit_to_sell
             if price_change_pct < min_required:
                 logger.debug(
                     "evaluate_symbol: SELL gated for %s — profit %.4f%% < required %.4f%%",
                     symbol, price_change_pct * 100, min_required * 100,
+                )
+                return
+
+            # Momentum hold: if the position is profitable and upward momentum
+            # is still strong, suppress the sell signal and let it run.
+            # Stop-loss bypasses this check (handled above).
+            if signal.indicators is not None and self._momentum_bullish_for_hold(
+                signal.indicators
+            ):
+                hold_msg = (
+                    f"HOLD (momentum) {symbol} @ {current_price:.2f} "
+                    f"+{price_change_pct * 100:.2f}%"
+                )
+                self._last_action = hold_msg
+                logger.info(
+                    "MOMENTUM HOLD: sell suppressed for %s — profit=%.2f%% "
+                    "momentum still bullish (fraction≥%.2f)",
+                    symbol,
+                    price_change_pct * 100,
+                    self._risk.momentum_hold_fraction,
                 )
                 return
 
@@ -335,9 +363,10 @@ class TradeEngine:
             news_feed:   Live news sentiment source.
         """
         logger.info(
-            "HFT loop starting for symbols=%s interval=%.2fs",
+            "HFT loop starting for symbols=%s interval=%.2fs risk=%s",
             symbols,
-            self._config.hft_interval,
+            self._risk.hft_interval,
+            self._risk.name,
         )
 
         while True:
@@ -354,10 +383,56 @@ class TradeEngine:
                     )
 
             try:
-                await asyncio.sleep(self._config.hft_interval)
+                await asyncio.sleep(self._risk.hft_interval)
             except asyncio.CancelledError:
                 logger.info("HFT loop cancelled during sleep.")
                 raise
+
+    def _momentum_bullish_for_hold(self, ind: "Indicators") -> bool:
+        """Return True when momentum indicators collectively justify holding a profitable position.
+
+        Evaluates up to four signals (only those with data):
+          1. MACD bullish AND histogram positive        (always available)
+          2. ROC above ``risk.roc_momentum_threshold``  (requires candle history)
+          3. ADX strong AND +DI > -DI                   (requires candle history)
+          4. Price above VWAP                           (requires candle history)
+
+        At least **two** signals must have data; otherwise returns False
+        (insufficient evidence to override a sell).
+
+        Returns True when ``bullish_count / available_count >= risk.momentum_hold_fraction``.
+        """
+        bullish: int = 0
+        available: int = 0
+
+        # 1. MACD — always available as a core indicator
+        available += 1
+        if ind.macd_bullish and ind.macd_hist_rising:
+            bullish += 1
+
+        # 2. Rate of Change
+        if ind.roc is not None:
+            available += 1
+            if ind.roc > self._risk.roc_momentum_threshold:
+                bullish += 1
+
+        # 3. ADX directional confirmation
+        if ind.adx is not None:
+            available += 1
+            if ind.adx > self._risk.adx_trend_threshold and ind.trend_bullish:
+                bullish += 1
+
+        # 4. VWAP position
+        if ind.vwap is not None:
+            available += 1
+            if ind.price_above_vwap:
+                bullish += 1
+
+        # Need at least two sources for a meaningful hold decision
+        if available < 2:
+            return False
+
+        return (bullish / available) >= self._risk.momentum_hold_fraction
 
     def get_last_action(self) -> str:
         """Return a human-readable summary of the most recent trade action.
@@ -369,4 +444,4 @@ class TradeEngine:
 
     def get_active_strategy(self) -> str:
         """Return the name of the currently active trading strategy."""
-        return "RSI+MACD+BB with News Sentiment Blend"
+        return f"RSI+MACD+BB+Sentiment [{self._risk.name.upper()} risk]"

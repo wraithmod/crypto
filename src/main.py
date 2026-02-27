@@ -1,7 +1,8 @@
 """
 Crypto Trading Platform - Main Entry Point
-Run with: python src/main.py
+Run with: python src/main.py [--cash AMOUNT]
 """
+import argparse
 import asyncio
 import logging
 import sys
@@ -12,9 +13,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config import config
+from src.trading.risk import PROFILES
 from src.agents.factory import create_provider
 from src.market.feed import MarketFeed
-from src.market.indices import IndicesFeed
+from src.market.indices import IndicesFeed, ASXFeedAdapter
 from src.portfolio.portfolio import Portfolio
 from src.news.feed import NewsFeed
 from src.prediction.predictor import Predictor
@@ -67,7 +69,7 @@ async def news_loop(news_feed: NewsFeed, interval: float) -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 
-async def main() -> None:
+async def main(risk_profile=None, trade_groups: set | None = None) -> None:
     """Wire all subsystems together and run the platform.
 
     Execution order
@@ -87,12 +89,30 @@ async def main() -> None:
     5. On :exc:`KeyboardInterrupt`, signal the market feed to stop gracefully,
        cancel all remaining tasks, and log the shutdown event.
     """
+    if risk_profile is None:
+        risk_profile = PROFILES["medium"]
+
+    # Resolve trade groups — "all" expands to crypto + asx
+    if trade_groups is None:
+        trade_groups = {"crypto"}
+    if "all" in trade_groups:
+        trade_groups = {"crypto", "asx"}
+
     logger.info("=== Crypto Trading Platform starting ===")
     logger.info(
-        "Symbols: %s | Initial cash: %.2f",
-        config.symbols,
+        "Trade groups: %s | Initial cash: %.2f | Risk: %s (confidence≥%.0f%% trade=%.0f%% stop=%.1f%%)",
+        sorted(trade_groups),
         config.initial_cash,
+        risk_profile.name,
+        risk_profile.confidence_threshold * 100,
+        risk_profile.trade_fraction * 100,
+        risk_profile.stop_loss_pct * 100,
     )
+    if "global" in trade_groups:
+        logger.info(
+            "Note: 'global' indices (%s) are display-only — index futures cannot be paper-traded.",
+            [s for s in config.tracked_indices],
+        )
 
     # ------------------------------------------------------------------
     # 1. Instantiate subsystems
@@ -110,7 +130,7 @@ async def main() -> None:
     portfolio = Portfolio(initial_cash=config.initial_cash)
     news_feed = NewsFeed(llm_provider)
     predictor = Predictor()
-    engine = TradeEngine(portfolio=portfolio, predictor=predictor, config=config)
+    engine = TradeEngine(portfolio=portfolio, predictor=predictor, config=config, risk=risk_profile)
     dashboard = Dashboard()
 
     logger.info("All subsystems instantiated.")
@@ -119,22 +139,8 @@ async def main() -> None:
     # 2. Build concurrent tasks
     # ------------------------------------------------------------------
     tasks = [
-        asyncio.create_task(
-            market_feed.start(),
-            name="market_feed",
-        ),
-        asyncio.create_task(
-            indices_feed.start(),
-            name="indices_feed",
-        ),
-        asyncio.create_task(
-            engine.run_hft_loop(
-                symbols=config.symbols,
-                market_feed=market_feed,
-                news_feed=news_feed,
-            ),
-            name="hft_loop",
-        ),
+        asyncio.create_task(market_feed.start(), name="market_feed"),
+        asyncio.create_task(indices_feed.start(), name="indices_feed"),
         asyncio.create_task(
             news_loop(news_feed=news_feed, interval=config.news_interval),
             name="news_loop",
@@ -150,6 +156,36 @@ async def main() -> None:
             name="dashboard",
         ),
     ]
+
+    # HFT loop for crypto (Binance WebSocket)
+    if "crypto" in trade_groups:
+        tasks.append(asyncio.create_task(
+            engine.run_hft_loop(
+                symbols=config.symbols,
+                market_feed=market_feed,
+                news_feed=news_feed,
+            ),
+            name="hft_loop_crypto",
+        ))
+        logger.info("HFT loop active for %d crypto symbols.", len(config.symbols))
+
+    # HFT loop for ASX (yfinance 15-20 min delayed via IndicesFeed)
+    if "asx" in trade_groups and config.asx_enabled:
+        asx_adapter = ASXFeedAdapter(indices_feed)
+        tasks.append(asyncio.create_task(
+            engine.run_hft_loop(
+                symbols=config.asx_symbols,
+                market_feed=asx_adapter,
+                news_feed=news_feed,
+            ),
+            name="hft_loop_asx",
+        ))
+        logger.info(
+            "HFT loop active for %d ASX symbols (15-20 min delayed via yfinance).",
+            len(config.asx_symbols),
+        )
+    elif "asx" in trade_groups and not config.asx_enabled:
+        logger.warning("--trade asx requested but config.asx_enabled=False — ASX HFT skipped.")
 
     logger.info(
         "Launching %d concurrent tasks: %s",
@@ -188,7 +224,38 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Crypto Trading Platform")
+    parser.add_argument(
+        "--cash",
+        type=float,
+        default=config.initial_cash,
+        metavar="AMOUNT",
+        help=f"Starting cash (default: {config.initial_cash:,.0f})",
+    )
+    parser.add_argument(
+        "--risk",
+        choices=["low", "medium", "high", "extreme"],
+        default="medium",
+        help="Trading risk profile: low | medium | high | extreme (default: medium)",
+    )
+    parser.add_argument(
+        "--trade",
+        nargs="+",
+        choices=["crypto", "asx", "global", "all"],
+        default=["crypto"],
+        metavar="GROUP",
+        help=(
+            "Which groups to actively trade (one or more): "
+            "crypto | asx | global | all  "
+            "(global is display-only — indices can't be paper-traded; default: crypto)"
+        ),
+    )
+    args = parser.parse_args()
+    config.initial_cash = args.cash
+    risk_profile = PROFILES[args.risk]
+    trade_groups = set(args.trade)
+
     try:
-        asyncio.run(main())
+        asyncio.run(main(risk_profile=risk_profile, trade_groups=trade_groups))
     except KeyboardInterrupt:
         print("\nShutting down...")

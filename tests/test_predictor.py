@@ -101,14 +101,14 @@ class TestIndicatorProperties:
         assert ind.rsi_oversold is False
         assert ind.rsi_overbought is False
 
-    def test_rsi_oversold_boundary_exactly_30(self):
-        """rsi_oversold is rsi < 30, so 30.0 must be False."""
-        ind = _make_indicators(rsi=30.0)
+    def test_rsi_oversold_boundary_exactly_35(self):
+        """rsi_oversold is rsi < 35, so 35.0 must be False."""
+        ind = _make_indicators(rsi=35.0)
         assert ind.rsi_oversold is False
 
-    def test_rsi_overbought_boundary_exactly_70(self):
-        """rsi_overbought is rsi > 70, so 70.0 must be False."""
-        ind = _make_indicators(rsi=70.0)
+    def test_rsi_overbought_boundary_exactly_65(self):
+        """rsi_overbought is rsi > 65, so 65.0 must be False."""
+        ind = _make_indicators(rsi=65.0)
         assert ind.rsi_overbought is False
 
     def test_macd_bullish_when_macd_above_signal(self):
@@ -165,11 +165,13 @@ class TestRuleBasedSignal:
     def test_hold_when_no_conditions_triggered(self):
         """Neutral RSI + neutral MACD + price mid-band → hold."""
         predictor = Predictor()
-        # Price is not near either band, RSI is neutral, MACD is neutral.
+        # macd_hist > 0 prevents the MACD bearish sell condition from firing
+        # (requires not_bullish AND not_hist_rising simultaneously).
         ind = _make_indicators(
             rsi=50.0,
             macd=0.0,
             macd_signal=1.0,   # macd < signal → not bullish
+            macd_hist=0.1,     # positive hist → hist_rising=True → no MACD sell
             price=45_000.0,
             bb_upper=46_000.0,
             bb_lower=44_000.0,
@@ -238,11 +240,12 @@ class TestGetSignal:
         """A "hold" technical signal with positive sentiment > 0.3 → "buy"."""
         predictor = Predictor()
 
-        # Patch compute_indicators to return neutral indicators that yield hold
+        # macd_hist=0.1 prevents MACD bearish sell trigger so rule_based yields hold
         neutral_ind = _make_indicators(
             rsi=50.0,
             macd=0.0,
             macd_signal=1.0,
+            macd_hist=0.1,
             price=45_000.0,
             bb_upper=46_000.0,
             bb_lower=44_000.0,
@@ -272,6 +275,7 @@ class TestGetSignal:
             rsi=50.0,
             macd=0.0,
             macd_signal=1.0,
+            macd_hist=0.1,
             price=45_000.0,
             bb_upper=46_000.0,
             bb_lower=44_000.0,
@@ -295,6 +299,7 @@ class TestGetSignal:
             rsi=50.0,
             macd=0.0,
             macd_signal=1.0,
+            macd_hist=0.1,
             price=45_000.0,
             bb_upper=46_000.0,
             bb_lower=44_000.0,
