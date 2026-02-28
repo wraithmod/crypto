@@ -156,6 +156,28 @@ class AppConfig:
         "ALL.AX",   # Aristocrat Leisure (gaming) ~$25B
     ])
 
+    # -----------------------------------------------------------------------
+    # Multi-exchange feeds — experimental, disabled by default
+    # -----------------------------------------------------------------------
+
+    # Bybit USDT-margined linear perpetuals
+    bybit_enabled: bool = False
+    bybit_symbols: list[str] = field(default_factory=lambda: [
+        "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT",
+        "XRPUSDT", "ADAUSDT", "AVAXUSDT", "DOGEUSDT",
+        "LINKUSDT", "NEARUSDT",
+    ])
+
+    # OKX spot (symbols supplied in Binance format; converted internally)
+    okx_enabled: bool = False
+    okx_symbols: list[str] = field(default_factory=lambda: [
+        "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT",
+        "XRPUSDT", "ADAUSDT",
+    ])
+
+    # Deribit implied-volatility index (BTC DVOL + ETH DVOL)
+    deribit_enabled: bool = False
+
     # ASX-specific news RSS feeds (Australian finance)
     asx_news_feeds: list[str] = field(default_factory=lambda: [
         # Tier 1 — major Australian business news

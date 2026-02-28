@@ -18,6 +18,9 @@ from src.trading.strategy import STRATEGIES
 from src.agents.factory import create_provider
 from src.market.feed import MarketFeed
 from src.market.indices import IndicesFeed, ASXFeedAdapter
+from src.market.bybit_feed import BybitFeed
+from src.market.okx_feed import OKXFeed
+from src.market.deribit_feed import DeribitVolFeed
 from src.portfolio.portfolio import Portfolio
 from src.news.feed import NewsFeed
 from src.prediction.predictor import Predictor
@@ -70,7 +73,7 @@ async def news_loop(news_feed: NewsFeed, interval: float) -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 
-async def main(risk_profile=None, trade_groups: set | None = None, strategy=None) -> None:
+async def main(risk_profile=None, trade_groups: set | None = None, strategy=None, feeds: set | None = None) -> None:
     """Wire all subsystems together and run the platform.
 
     Execution order
@@ -101,11 +104,18 @@ async def main(risk_profile=None, trade_groups: set | None = None, strategy=None
     if "all" in trade_groups:
         trade_groups = {"crypto", "asx"}
 
+    # Resolve extra feeds — default to binance only
+    if feeds is None:
+        feeds = {"binance"}
+    if "all" in feeds:
+        feeds = {"binance", "bybit", "okx", "deribit"}
+
     logger.info("=== Crypto Trading Platform starting ===")
     logger.info(
-        "Trade groups: %s | Initial cash: %.2f | Risk: %s | Strategy: %s "
+        "Trade groups: %s | Feeds: %s | Initial cash: %.2f | Risk: %s | Strategy: %s "
         "(confidence≥%.0f%% trade=%.0f%% stop=%.1f%%)",
         sorted(trade_groups),
+        sorted(feeds),
         config.initial_cash,
         risk_profile.name,
         strategy.name,
@@ -195,6 +205,52 @@ async def main(risk_profile=None, trade_groups: set | None = None, strategy=None
     elif "asx" in trade_groups and not config.asx_enabled:
         logger.warning("--trade asx requested but config.asx_enabled=False — ASX HFT skipped.")
 
+    # ------------------------------------------------------------------
+    # Extra exchange feeds (Bybit, OKX, Deribit) — controlled by --feeds
+    # ------------------------------------------------------------------
+
+    # Bybit linear perpetuals feed + HFT loop
+    if "bybit" in feeds and config.bybit_enabled:
+        bybit_queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
+        bybit_feed = BybitFeed(symbols=config.bybit_symbols, price_queue=bybit_queue)
+        tasks.append(asyncio.create_task(bybit_feed.start(), name="bybit_feed"))
+        tasks.append(asyncio.create_task(
+            engine.run_hft_loop(
+                symbols=config.bybit_symbols,
+                market_feed=bybit_feed,
+                news_feed=news_feed,
+            ),
+            name="hft_loop_bybit",
+        ))
+        logger.info("Bybit feed + HFT loop active for %d symbols.", len(config.bybit_symbols))
+    elif "bybit" in feeds and not config.bybit_enabled:
+        logger.warning("--feeds bybit requested but config.bybit_enabled=False — Bybit feed skipped.")
+
+    # OKX spot feed + HFT loop
+    if "okx" in feeds and config.okx_enabled:
+        okx_queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
+        okx_feed = OKXFeed(symbols=config.okx_symbols, price_queue=okx_queue)
+        tasks.append(asyncio.create_task(okx_feed.start(), name="okx_feed"))
+        tasks.append(asyncio.create_task(
+            engine.run_hft_loop(
+                symbols=config.okx_symbols,
+                market_feed=okx_feed,
+                news_feed=news_feed,
+            ),
+            name="hft_loop_okx",
+        ))
+        logger.info("OKX feed + HFT loop active for %d symbols.", len(config.okx_symbols))
+    elif "okx" in feeds and not config.okx_enabled:
+        logger.warning("--feeds okx requested but config.okx_enabled=False — OKX feed skipped.")
+
+    # Deribit DVOL implied-volatility feed (display/signal only — no HFT trading)
+    if "deribit" in feeds and config.deribit_enabled:
+        deribit_feed = DeribitVolFeed()
+        tasks.append(asyncio.create_task(deribit_feed.start(), name="deribit_feed"))
+        logger.info("Deribit DVOL feed active (BTC + ETH implied volatility).")
+    elif "deribit" in feeds and not config.deribit_enabled:
+        logger.warning("--feeds deribit requested but config.deribit_enabled=False — Deribit feed skipped.")
+
     logger.info(
         "Launching %d concurrent tasks: %s",
         len(tasks),
@@ -264,13 +320,26 @@ if __name__ == "__main__":
             "(global is display-only — indices can't be paper-traded; default: crypto)"
         ),
     )
+    parser.add_argument(
+        "--feeds",
+        nargs="+",
+        choices=["binance", "bybit", "okx", "deribit", "all"],
+        default=["binance"],
+        metavar="FEED",
+        help=(
+            "Which exchange feeds to enable (one or more): "
+            "binance | bybit | okx | deribit | all  "
+            "(bybit/okx/deribit require config.*_enabled=True; default: binance)"
+        ),
+    )
     args = parser.parse_args()
     config.initial_cash = args.cash
     risk_profile = PROFILES[args.risk]
     strategy = STRATEGIES[args.strategy]
     trade_groups = set(args.trade)
+    feeds = set(args.feeds)
 
     try:
-        asyncio.run(main(risk_profile=risk_profile, trade_groups=trade_groups, strategy=strategy))
+        asyncio.run(main(risk_profile=risk_profile, trade_groups=trade_groups, strategy=strategy, feeds=feeds))
     except KeyboardInterrupt:
         print("\nShutting down...")
