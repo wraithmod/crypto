@@ -22,6 +22,15 @@ def _make_indicators(
     bb_mid: float = 45_000.0,
     bb_lower: float = 44_000.0,
     price: float = 45_000.0,
+    # New optional fields — default None for backward compatibility
+    ema9: float | None = None,
+    ema21: float | None = None,
+    ema55: float | None = None,
+    stoch_k: float | None = None,
+    stoch_d: float | None = None,
+    donchian_high: float | None = None,
+    donchian_low: float | None = None,
+    atr: float | None = None,
 ) -> Indicators:
     """Return an Indicators dataclass with sensible neutral defaults."""
     return Indicators(
@@ -33,6 +42,14 @@ def _make_indicators(
         bb_mid=bb_mid,
         bb_lower=bb_lower,
         price=price,
+        ema9=ema9,
+        ema21=ema21,
+        ema55=ema55,
+        stoch_k=stoch_k,
+        stoch_d=stoch_d,
+        donchian_high=donchian_high,
+        donchian_low=donchian_low,
+        atr=atr,
     )
 
 
@@ -332,3 +349,117 @@ class TestGetSignal:
 
         # The rule-based signal is sell; sentiment nudge applies only on hold.
         assert result.direction == "sell"
+
+
+# ---------------------------------------------------------------------------
+# New indicators: EMA, Donchian, strategy routing
+# ---------------------------------------------------------------------------
+
+class TestNewIndicators:
+    def test_ema9_and_ema21_populated_on_50_prices(self):
+        """50 prices is enough for EMA9 and EMA21 but not EMA55."""
+        predictor = Predictor()
+        prices = [45_000.0 + i * 10 for i in range(50)]
+        result = predictor.compute_indicators(prices)
+        assert result is not None
+        assert result.ema9 is not None
+        assert result.ema21 is not None
+
+    def test_ema55_none_on_26_prices(self):
+        """26 prices is below the 55-bar warm-up — EMA55 must be None."""
+        predictor = Predictor()
+        prices = [45_000.0 + i * 10 for i in range(26)]
+        result = predictor.compute_indicators(prices)
+        # result may be None if MACD NaN, but if we get one, ema55 must be None
+        if result is not None:
+            assert result.ema55 is None
+
+    def test_ema55_populated_on_60_prices(self):
+        """60 prices provides enough warm-up for EMA55."""
+        predictor = Predictor()
+        prices = [45_000.0 + i * 10 for i in range(60)]
+        result = predictor.compute_indicators(prices)
+        assert result is not None
+        assert result.ema55 is not None
+
+    def test_donchian_populated_on_sufficient_prices(self):
+        """donchian_high/low set correctly from the 20 bars before current."""
+        predictor = Predictor()
+        # Build a price series where the last 20 bars (excl. current) are 44k-45k.
+        prices = [45_000.0] * 200
+        result = predictor.compute_indicators(prices)
+        assert result is not None
+        assert result.donchian_high is not None
+        assert result.donchian_low is not None
+        # All prices equal → high == low == 45_000
+        assert result.donchian_high == pytest.approx(45_000.0)
+        assert result.donchian_low == pytest.approx(45_000.0)
+
+    def test_donchian_high_is_max_of_prior_20(self):
+        """donchian_high should equal the max of prices[-21:-1]."""
+        predictor = Predictor()
+        prices = [44_000.0] * 180 + [46_000.0] * 19 + [43_000.0]
+        result = predictor.compute_indicators(prices)
+        assert result is not None
+        assert result.donchian_high == pytest.approx(46_000.0)
+
+    def test_new_indicator_fields_default_none_without_candles(self, sample_prices):
+        """Without candle data, stoch_k/stoch_d/atr remain None."""
+        predictor = Predictor()
+        result = predictor.compute_indicators(sample_prices)
+        assert result is not None
+        assert result.stoch_k is None
+        assert result.stoch_d is None
+        assert result.atr is None
+
+
+class TestRuleBasedSignalWithStrategy:
+    def test_trend_strategy_hold_when_all_ema_none(self):
+        """TrendStrategy with no EMA/ADX/ROC/VWAP data → hold."""
+        from src.trading.strategy import TrendStrategy
+        predictor = Predictor()
+        ind = _make_indicators()  # no EMA, no ADX, neutral RSI
+        result = predictor.rule_based_signal(ind, strategy=TrendStrategy())
+        assert result.direction == "hold"
+
+    def test_trend_strategy_buy_on_full_ema_alignment(self):
+        """TrendStrategy: EMA9>EMA21>EMA55 + ADX bullish → buy."""
+        from src.trading.strategy import TrendStrategy
+        predictor = Predictor()
+        ind = _make_indicators(
+            ema9=105.0, ema21=100.0, ema55=95.0,
+            price=101.0,
+        )
+        result = predictor.rule_based_signal(ind, strategy=TrendStrategy())
+        assert result.direction == "buy"
+        assert result.confidence >= 0.5  # 2.0 / 4.0
+
+    def test_classic_strategy_default_when_none(self):
+        """rule_based_signal with strategy=None uses ClassicStrategy (default)."""
+        predictor = Predictor()
+        ind = _make_indicators(rsi=20.0)  # strongly oversold → buy
+        result = predictor.rule_based_signal(ind, strategy=None)
+        assert result.direction == "buy"
+
+    def test_sentiment_strategy_skip_nudge_flag(self):
+        """get_signal with SentimentStrategy: skip_sentiment_nudge=True suppresses nudge."""
+        import asyncio
+        from src.trading.strategy import SentimentStrategy
+        predictor = Predictor()
+        # Neutral technical indicator → would normally get sentiment nudge
+        neutral_ind = _make_indicators(
+            rsi=50.0, macd=0.0, macd_signal=1.0, macd_hist=0.1,
+        )
+
+        async def _run():
+            with patch.object(predictor, "compute_indicators", return_value=neutral_ind):
+                return await predictor.get_signal(
+                    "BTCUSDT",
+                    [45_000.0] * 200,
+                    news_sentiment=0.9,   # strong positive — but strategy owns sentiment
+                    strategy=SentimentStrategy(),
+                )
+
+        result = asyncio.get_event_loop().run_until_complete(_run())
+        # SentimentStrategy scores sentiment=0.9 → 2.0 points → buy
+        assert result.direction == "buy"

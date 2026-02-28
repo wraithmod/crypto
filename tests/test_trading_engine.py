@@ -48,12 +48,14 @@ def _make_engine(
     predictor: Predictor = None,
     config: AppConfig = None,
     risk: RiskProfile = None,
+    strategy=None,
 ) -> TradeEngine:
     return TradeEngine(
         portfolio=portfolio or _make_portfolio(),
         predictor=predictor or _make_predictor(),
         config=config or _make_config(),
         risk=risk if risk is not None else MEDIUM,
+        strategy=strategy,
     )
 
 
@@ -247,14 +249,30 @@ class TestGetActiveStrategy:
         assert engine.get_active_strategy() != ""
 
     def test_get_active_strategy_contains_known_terms(self):
-        """Strategy name should mention the indicators we actually use."""
+        """Strategy string should contain a recognisable strategy or indicator name."""
         engine = _make_engine()
-        strategy = engine.get_active_strategy()
-        # At least one recognisable indicator or sentiment keyword
-        keywords = {"RSI", "MACD", "BB", "Sentiment", "News", "Blend"}
-        assert any(kw in strategy for kw in keywords), (
-            f"Strategy string '{strategy}' doesn't mention any expected keywords"
+        result = engine.get_active_strategy()
+        # Accept both the new strategy-name format and old indicator-based format
+        keywords = {
+            "RSI", "MACD", "BB", "Sentiment", "News", "Blend",
+            "CLASSIC", "TREND", "BREAKOUT", "SCALP",
+        }
+        assert any(kw in result for kw in keywords), (
+            f"Strategy string '{result}' doesn't mention any expected keywords"
         )
+
+    def test_get_active_strategy_shows_strategy_name(self):
+        """get_active_strategy() includes the strategy name in uppercase."""
+        from src.trading.strategy import STRATEGIES
+        engine = _make_engine(strategy=STRATEGIES["trend"])
+        result = engine.get_active_strategy()
+        assert "TREND" in result
+
+    def test_get_active_strategy_shows_risk_name(self):
+        """get_active_strategy() includes the risk profile name in uppercase."""
+        engine = _make_engine()
+        result = engine.get_active_strategy()
+        assert "MEDIUM" in result
 
 
 # ---------------------------------------------------------------------------
@@ -756,3 +774,47 @@ class TestMomentumHold:
             await engine.evaluate_symbol("BTCUSDT", market_feed, news_feed)
 
         assert "BTCUSDT" not in portfolio.get_holdings()
+
+
+# ---------------------------------------------------------------------------
+# Strategy routing
+# ---------------------------------------------------------------------------
+
+class TestStrategyRouting:
+    def test_engine_defaults_to_classic_strategy(self):
+        """TradeEngine without explicit strategy uses ClassicStrategy."""
+        from src.trading.strategy import ClassicStrategy
+        engine = _make_engine()
+        assert isinstance(engine._strategy, ClassicStrategy)
+
+    def test_engine_stores_explicit_strategy(self):
+        """TradeEngine with explicit strategy stores it."""
+        from src.trading.strategy import STRATEGIES
+        trend = STRATEGIES["trend"]
+        engine = _make_engine(strategy=trend)
+        assert engine._strategy is trend
+
+    @pytest.mark.asyncio
+    async def test_evaluate_symbol_passes_strategy_to_predictor(self):
+        """evaluate_symbol forwards self._strategy to predictor.get_signal()."""
+        from src.trading.strategy import STRATEGIES
+        trend = STRATEGIES["trend"]
+
+        predictor = _make_predictor()
+        engine = _make_engine(predictor=predictor, strategy=trend)
+
+        prices = [45_000.0] * 200
+        market_feed = _make_market_feed(price_history=prices, latest_price=45_000.0)
+        news_feed = _make_news_feed()
+
+        captured_kwargs = {}
+
+        async def capturing_get_signal(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            return _make_signal(direction="hold", confidence=0.0)
+
+        with patch.object(predictor, "get_signal", side_effect=capturing_get_signal):
+            await engine.evaluate_symbol("BTCUSDT", market_feed, news_feed)
+
+        assert "strategy" in captured_kwargs
+        assert captured_kwargs["strategy"] is trend

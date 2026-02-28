@@ -18,6 +18,7 @@ from src.prediction.predictor import Predictor, Signal, Indicators
 from src.market.feed import MarketFeed, PriceTick
 from src.news.feed import NewsFeed
 from src.trading.risk import RiskProfile, MEDIUM
+from src.trading.strategy import TradingStrategy, DEFAULT_STRATEGY
 
 logger = logging.getLogger(__name__)
 
@@ -39,11 +40,13 @@ class TradeEngine:
         predictor: Predictor,
         config: AppConfig = default_config,
         risk: RiskProfile = MEDIUM,
+        strategy: TradingStrategy | None = None,
     ) -> None:
         self._portfolio: Portfolio = portfolio
         self._predictor: Predictor = predictor
         self._config: AppConfig = config
         self._risk: RiskProfile = risk
+        self._strategy: TradingStrategy = strategy if strategy is not None else DEFAULT_STRATEGY
         self._last_action: str = "No action yet"
 
     # ------------------------------------------------------------------
@@ -155,6 +158,7 @@ class TradeEngine:
             symbol, price_history, news_sentiment,
             risk=self._risk,
             candles=candle_history if candle_history else None,
+            strategy=self._strategy,
         )
 
         logger.debug(
@@ -444,4 +448,4 @@ class TradeEngine:
 
     def get_active_strategy(self) -> str:
         """Return the name of the currently active trading strategy."""
-        return f"RSI+MACD+BB+Sentiment [{self._risk.name.upper()} risk]"
+        return f"{self._strategy.name.upper()} [{self._risk.name.upper()} risk]"

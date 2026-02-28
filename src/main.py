@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config import config
 from src.trading.risk import PROFILES
+from src.trading.strategy import STRATEGIES
 from src.agents.factory import create_provider
 from src.market.feed import MarketFeed
 from src.market.indices import IndicesFeed, ASXFeedAdapter
@@ -69,7 +70,7 @@ async def news_loop(news_feed: NewsFeed, interval: float) -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 
-async def main(risk_profile=None, trade_groups: set | None = None) -> None:
+async def main(risk_profile=None, trade_groups: set | None = None, strategy=None) -> None:
     """Wire all subsystems together and run the platform.
 
     Execution order
@@ -91,6 +92,8 @@ async def main(risk_profile=None, trade_groups: set | None = None) -> None:
     """
     if risk_profile is None:
         risk_profile = PROFILES["medium"]
+    if strategy is None:
+        strategy = STRATEGIES["classic"]
 
     # Resolve trade groups — "all" expands to crypto + asx
     if trade_groups is None:
@@ -100,10 +103,12 @@ async def main(risk_profile=None, trade_groups: set | None = None) -> None:
 
     logger.info("=== Crypto Trading Platform starting ===")
     logger.info(
-        "Trade groups: %s | Initial cash: %.2f | Risk: %s (confidence≥%.0f%% trade=%.0f%% stop=%.1f%%)",
+        "Trade groups: %s | Initial cash: %.2f | Risk: %s | Strategy: %s "
+        "(confidence≥%.0f%% trade=%.0f%% stop=%.1f%%)",
         sorted(trade_groups),
         config.initial_cash,
         risk_profile.name,
+        strategy.name,
         risk_profile.confidence_threshold * 100,
         risk_profile.trade_fraction * 100,
         risk_profile.stop_loss_pct * 100,
@@ -130,7 +135,10 @@ async def main(risk_profile=None, trade_groups: set | None = None) -> None:
     portfolio = Portfolio(initial_cash=config.initial_cash)
     news_feed = NewsFeed(llm_provider)
     predictor = Predictor()
-    engine = TradeEngine(portfolio=portfolio, predictor=predictor, config=config, risk=risk_profile)
+    engine = TradeEngine(
+        portfolio=portfolio, predictor=predictor, config=config,
+        risk=risk_profile, strategy=strategy,
+    )
     dashboard = Dashboard()
 
     logger.info("All subsystems instantiated.")
@@ -239,6 +247,12 @@ if __name__ == "__main__":
         help="Trading risk profile: low | medium | high | extreme (default: medium)",
     )
     parser.add_argument(
+        "--strategy",
+        choices=list(STRATEGIES),
+        default="classic",
+        help="Signal strategy: classic|trend|breakout|scalp|sentiment (default: classic)",
+    )
+    parser.add_argument(
         "--trade",
         nargs="+",
         choices=["crypto", "asx", "global", "all"],
@@ -253,9 +267,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
     config.initial_cash = args.cash
     risk_profile = PROFILES[args.risk]
+    strategy = STRATEGIES[args.strategy]
     trade_groups = set(args.trade)
 
     try:
-        asyncio.run(main(risk_profile=risk_profile, trade_groups=trade_groups))
+        asyncio.run(main(risk_profile=risk_profile, trade_groups=trade_groups, strategy=strategy))
     except KeyboardInterrupt:
         print("\nShutting down...")

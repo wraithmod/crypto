@@ -12,6 +12,7 @@ import ta
 if TYPE_CHECKING:
     from src.trading.risk import RiskProfile
     from src.market.feed import CandleTick
+    from src.trading.strategy import TradingStrategy
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,16 @@ class Indicators:
     adx: float | None = None             # Average Directional Index
     adx_plus_di: float | None = None     # +DI (bullish directional)
     adx_minus_di: float | None = None    # -DI (bearish directional)
+
+    # Strategy-specific indicators
+    ema9: float | None = None            # EMA 9-period  (prices)
+    ema21: float | None = None           # EMA 21-period (prices)
+    ema55: float | None = None           # EMA 55-period (None until 55 bars)
+    stoch_k: float | None = None         # Stochastic %K  (requires candle OHLC)
+    stoch_d: float | None = None         # Stochastic %D signal line
+    donchian_high: float | None = None   # 20-period high excl. current bar
+    donchian_low: float | None = None    # 20-period low  excl. current bar
+    atr: float | None = None             # ATR 14-period  (requires candle OHLC)
 
     # ---------------------------------------------------------------------------
     # Classic indicator properties (unchanged)
@@ -207,6 +218,63 @@ class Predictor:
             logger.debug("ADX computation failed: %s", exc)
             return None
 
+    @staticmethod
+    def _safe_ema(series: pd.Series, window: int) -> float | None:
+        """Compute EMA for the given window; returns None if result is NaN."""
+        try:
+            val = ta.trend.EMAIndicator(series, window=window).ema_indicator().iloc[-1]
+            if np.isnan(val):
+                return None
+            return float(val)
+        except Exception as exc:
+            logger.debug("EMA(%d) computation failed: %s", window, exc)
+            return None
+
+    @staticmethod
+    def _compute_stochastic(
+        candles: list["CandleTick"],
+        window: int = 14,
+        smooth_window: int = 3,
+    ) -> tuple[float, float] | None:
+        """Return (stoch_k, stoch_d) or None on failure."""
+        try:
+            high = pd.Series([c.high for c in candles], dtype=float)
+            low = pd.Series([c.low for c in candles], dtype=float)
+            close = pd.Series([c.close for c in candles], dtype=float)
+            stoch = ta.momentum.StochasticOscillator(
+                high=high, low=low, close=close,
+                window=window, smooth_window=smooth_window,
+            )
+            k_val = stoch.stoch().iloc[-1]
+            d_val = stoch.stoch_signal().iloc[-1]
+            if np.isnan(k_val) or np.isnan(d_val):
+                return None
+            return float(k_val), float(d_val)
+        except Exception as exc:
+            logger.debug("Stochastic computation failed: %s", exc)
+            return None
+
+    @staticmethod
+    def _compute_atr(
+        candles: list["CandleTick"],
+        window: int = 14,
+    ) -> float | None:
+        """Return ATR value or None on failure."""
+        try:
+            high = pd.Series([c.high for c in candles], dtype=float)
+            low = pd.Series([c.low for c in candles], dtype=float)
+            close = pd.Series([c.close for c in candles], dtype=float)
+            atr = ta.volatility.AverageTrueRange(
+                high=high, low=low, close=close, window=window
+            )
+            val = atr.average_true_range().iloc[-1]
+            if np.isnan(val):
+                return None
+            return float(val)
+        except Exception as exc:
+            logger.debug("ATR computation failed: %s", exc)
+            return None
+
     # ---------------------------------------------------------------------------
     # Main indicator computation
     # ---------------------------------------------------------------------------
@@ -296,6 +364,28 @@ class Predictor:
             if adx_result is not None:
                 ind.adx, ind.adx_plus_di, ind.adx_minus_di = adx_result
 
+        # EMA crossover indicators (price series only; always attempt)
+        ind.ema9 = self._safe_ema(series, 9)
+        ind.ema21 = self._safe_ema(series, 21)
+        ind.ema55 = self._safe_ema(series, 55)  # None when < 55 bars
+
+        # Donchian channel (20-period, exclude current bar)
+        if len(prices) >= 21:
+            ind.donchian_high = float(max(prices[-21:-1]))
+            ind.donchian_low = float(min(prices[-21:-1]))
+
+        # Stochastic K/D (candles required, 17+ bars for warm-up)
+        if candles and len(candles) >= 17:
+            stoch_result = self._compute_stochastic(candles)
+            if stoch_result is not None:
+                ind.stoch_k, ind.stoch_d = stoch_result
+
+        # ATR (candles required, 28+ for reliable values)
+        if candles and len(candles) >= 28:
+            atr_val = self._compute_atr(candles)
+            if atr_val is not None:
+                ind.atr = atr_val
+
         return ind
 
     # ---------------------------------------------------------------------------
@@ -306,210 +396,35 @@ class Predictor:
         self,
         ind: Indicators,
         risk: "RiskProfile | None" = None,
+        strategy: "TradingStrategy | None" = None,
+        sentiment: float = 0.0,
     ) -> Signal:
-        """Derive a directional signal from technical indicator rules.
+        """Derive a directional signal by delegating to the active strategy.
 
-        Classic conditions (weight 1.0 each, max 4 in each direction):
-          BUY:  1. RSI strongly/mildly oversold
-                2. MACD bullish + histogram rising
-                3. Price near lower Bollinger Band
-                4. Price above SMA + MACD bullish (trend confirm)
+        The strategy's ``score()`` method returns (buy_score, sell_score,
+        buy_triggers, sell_triggers).  This method applies the decision logic:
+        whichever score is higher (and > 0) determines direction; confidence
+        is clamped to [0.0, 1.0] using the strategy's ``max_score``.
 
-          SELL: 1. RSI strongly/mildly overbought
-                2. MACD bearish + histogram falling
-                3. Price near upper Bollinger Band
-                4. Price below SMA + MACD bearish (trend confirm)
-
-        Momentum conditions (volume/ADX/VWAP — only scored when data available):
-          BUY:  5. Volume surge + RSI oversold         (weight 1.5)
-                6. Momentum ROC + MACD bullish          (weight 1.0)
-                7. ADX trend confirmed + VWAP above     (weight 0.75)
-                8. VWAP reclaim + improving MACD hist   (weight 0.5)
-
-          SELL: 5. Volume surge + RSI overbought        (weight 1.5)
-                6. Momentum ROC negative + MACD bearish (weight 1.0)
-                7. ADX trend confirmed + VWAP below     (weight 0.75)
-                8. VWAP breakdown + worsening MACD hist (weight 0.5)
-
-        Confidence = score / max_score, clamped to [0.0, 1.0].
-        max_score = 4.0 (the 4 classic conditions).  Momentum signals are
-        bonus score that can push confidence above 1.0 before clamping,
-        so they increase conviction without inflating the denominator.
-        Typical thresholds by profile: LOW≥0.60 (3 cond.), MEDIUM≥0.45 (2 cond.),
-        HIGH≥0.30 (2 cond.), EXTREME≥0.20 (1 cond.).
+        Args:
+            ind:       Computed technical indicators.
+            risk:      Risk profile supplying threshold values.
+            strategy:  Strategy to use for scoring.  Defaults to ClassicStrategy.
+            sentiment: News sentiment score passed through to strategies that
+                       use it (e.g. SentimentStrategy).
         """
         if risk is None:
             from src.trading.risk import MEDIUM
             risk = MEDIUM
 
-        # Resolve risk-profile-based ROC period (default to stored if unavailable)
-        roc_val = ind.roc  # computed with default period; good enough for signal
+        if strategy is None:
+            from src.trading.strategy import DEFAULT_STRATEGY
+            strategy = DEFAULT_STRATEGY
 
-        # Denominator = the 4 classic conditions only (each worth 1.0).
-        # Momentum signals add bonus score ON TOP; the denominator stays at 4.0
-        # so that 3 classic conditions fires at 0.75 confidence regardless of
-        # whether candle data (and therefore momentum indicators) is available.
-        # Using the full theoretical max (7.75) would require 3.5 points to
-        # reach the 0.45 MEDIUM threshold, which never happens in normal markets.
-        max_score = 4.0
-
-        # ---------------------------------------------------------------
-        # BUY scoring
-        # ---------------------------------------------------------------
-        buy_score: float = 0.0
-        buy_triggers: list[str] = []
-
-        # 1. RSI oversold (strong or mild — mutually exclusive)
-        if ind.rsi < risk.rsi_oversold:
-            buy_score += 1.0
-            buy_triggers.append(f"RSI strongly oversold ({ind.rsi:.1f}<{risk.rsi_oversold})")
-        elif ind.rsi < risk.rsi_weak_oversold:
-            buy_score += 1.0
-            buy_triggers.append(f"RSI mildly oversold ({ind.rsi:.1f}<{risk.rsi_weak_oversold})")
-
-        # 2. MACD bullish + histogram rising
-        if ind.macd_bullish and ind.macd_hist_rising:
-            buy_score += 1.0
-            buy_triggers.append(
-                f"MACD bullish+rising hist ({ind.macd:.4f}>{ind.macd_signal:.4f})"
-            )
-
-        # 3. Price near lower Bollinger Band
-        if ind.price <= ind.bb_lower * risk.bb_lower_tolerance:
-            buy_score += 1.0
-            buy_triggers.append(
-                f"Price near lower BB ({ind.price:.4f}≤{ind.bb_lower * risk.bb_lower_tolerance:.4f})"
-            )
-
-        # 4. Price above SMA + MACD bullish (trend confirmation)
-        if ind.price_above_mid_bb and ind.macd_bullish:
-            buy_score += 1.0
-            buy_triggers.append("Price above SMA+MACD bullish (trend confirm)")
-
-        # 5. Volume surge + RSI oversold (weight 1.5)
-        if (
-            ind.volume_surge is not None
-            and ind.volume_surge >= risk.volume_surge_threshold
-            and ind.rsi < risk.rsi_oversold
-        ):
-            buy_score += 1.5
-            buy_triggers.append(
-                f"Volume surge {ind.volume_surge:.1f}x + RSI oversold (accumulation)"
-            )
-
-        # 6. Positive ROC momentum + MACD bullish (weight 1.0)
-        if (
-            roc_val is not None
-            and roc_val > risk.roc_momentum_threshold
-            and ind.macd_bullish
-            and ind.macd_hist_rising
-        ):
-            buy_score += 1.0
-            buy_triggers.append(
-                f"ROC momentum +{roc_val:.2f}% + MACD bullish"
-            )
-
-        # 7. ADX strong trend + +DI dominant + price above VWAP (weight 0.75)
-        if (
-            ind.adx is not None
-            and ind.adx > risk.adx_trend_threshold
-            and ind.trend_bullish
-            and ind.price_above_vwap
-        ):
-            buy_score += 0.75
-            buy_triggers.append(
-                f"ADX {ind.adx:.1f} trend + bullish DI + above VWAP"
-            )
-
-        # 8. Price reclaims VWAP + RSI mild oversold + hist improving (weight 0.5)
-        if (
-            ind.price_above_vwap
-            and ind.rsi < risk.rsi_weak_oversold
-            and ind.macd_hist_rising
-        ):
-            buy_score += 0.5
-            buy_triggers.append("VWAP reclaim + improving momentum")
-
-        # ---------------------------------------------------------------
-        # SELL scoring
-        # ---------------------------------------------------------------
-        sell_score: float = 0.0
-        sell_triggers: list[str] = []
-
-        # 1. RSI overbought (strong or mild — mutually exclusive)
-        if ind.rsi > risk.rsi_overbought:
-            sell_score += 1.0
-            sell_triggers.append(
-                f"RSI strongly overbought ({ind.rsi:.1f}>{risk.rsi_overbought})"
-            )
-        elif ind.rsi > risk.rsi_weak_overbought:
-            sell_score += 1.0
-            sell_triggers.append(
-                f"RSI mildly overbought ({ind.rsi:.1f}>{risk.rsi_weak_overbought})"
-            )
-
-        # 2. MACD bearish + histogram falling
-        if not ind.macd_bullish and not ind.macd_hist_rising:
-            sell_score += 1.0
-            sell_triggers.append(
-                f"MACD bearish+falling hist ({ind.macd:.4f}<{ind.macd_signal:.4f})"
-            )
-
-        # 3. Price near upper Bollinger Band
-        if ind.price >= ind.bb_upper * risk.bb_upper_tolerance:
-            sell_score += 1.0
-            sell_triggers.append(
-                f"Price near upper BB ({ind.price:.4f}≥{ind.bb_upper * risk.bb_upper_tolerance:.4f})"
-            )
-
-        # 4. Price below SMA + MACD bearish (trend confirmation)
-        if ind.price_below_mid_bb and not ind.macd_bullish:
-            sell_score += 1.0
-            sell_triggers.append("Price below SMA+MACD bearish (trend confirm)")
-
-        # 5. Volume surge + RSI overbought (distribution, weight 1.5)
-        if (
-            ind.volume_surge is not None
-            and ind.volume_surge >= risk.volume_surge_threshold
-            and ind.rsi > risk.rsi_overbought
-        ):
-            sell_score += 1.5
-            sell_triggers.append(
-                f"Volume surge {ind.volume_surge:.1f}x + RSI overbought (distribution)"
-            )
-
-        # 6. Negative ROC momentum + MACD bearish (weight 1.0)
-        if (
-            roc_val is not None
-            and roc_val < -risk.roc_momentum_threshold
-            and not ind.macd_bullish
-            and not ind.macd_hist_rising
-        ):
-            sell_score += 1.0
-            sell_triggers.append(
-                f"ROC momentum {roc_val:.2f}% + MACD bearish"
-            )
-
-        # 7. ADX strong trend + -DI dominant + price below VWAP (weight 0.75)
-        if (
-            ind.adx is not None
-            and ind.adx > risk.adx_trend_threshold
-            and ind.trend_bearish
-            and ind.price_below_vwap
-        ):
-            sell_score += 0.75
-            sell_triggers.append(
-                f"ADX {ind.adx:.1f} trend + bearish DI + below VWAP"
-            )
-
-        # 8. Price breaks below VWAP + RSI mild overbought + hist deteriorating (weight 0.5)
-        if (
-            ind.price_below_vwap
-            and ind.rsi > risk.rsi_weak_overbought
-            and not ind.macd_hist_rising
-        ):
-            sell_score += 0.5
-            sell_triggers.append("VWAP breakdown + deteriorating momentum")
+        buy_score, sell_score, buy_triggers, sell_triggers = strategy.score(
+            ind, risk, sentiment
+        )
+        max_score = strategy.max_score
 
         # ---------------------------------------------------------------
         # Decision
@@ -552,6 +467,7 @@ class Predictor:
         news_sentiment: float = 0.0,
         risk: "RiskProfile | None" = None,
         candles: list[CandleTick] | None = None,
+        strategy: "TradingStrategy | None" = None,
     ) -> Signal:
         """Produce a final trading signal blending technical analysis and news sentiment.
 
@@ -585,10 +501,12 @@ class Predictor:
                 indicators=None,
             )
 
-        signal = self.rule_based_signal(ind, risk)
+        signal = self.rule_based_signal(ind, risk, strategy=strategy, sentiment=news_sentiment)
 
-        # Apply news sentiment nudge only when the technical signal is neutral.
-        if signal.direction == "hold":
+        # Apply news sentiment nudge only when the technical signal is neutral
+        # AND the active strategy does not handle sentiment itself.
+        skip_nudge = strategy is not None and strategy.skip_sentiment_nudge
+        if signal.direction == "hold" and not skip_nudge:
             threshold = risk.sentiment_nudge_threshold
             weighted = news_sentiment * risk.sentiment_weight
             if weighted > threshold:
