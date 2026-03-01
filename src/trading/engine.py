@@ -352,6 +352,7 @@ class TradeEngine:
         symbols: list[str],
         market_feed: MarketFeed,
         news_feed: NewsFeed,
+        market_hours_fn=None,
     ) -> None:
         """Run the high-frequency trading loop indefinitely.
 
@@ -361,30 +362,43 @@ class TradeEngine:
         ``asyncio.CancelledError``).
 
         Args:
-            symbols:     List of trading pairs to monitor, e.g.
-                         ``["BTCUSDT", "ETHUSDT"]``.
-            market_feed: Live price data source.
-            news_feed:   Live news sentiment source.
+            symbols:          List of trading pairs to monitor, e.g.
+                              ``["BTCUSDT", "ETHUSDT"]``.
+            market_feed:      Live price data source.
+            news_feed:        Live news sentiment source.
+            market_hours_fn:  Optional callable ``() -> bool``.  When
+                              provided, each cycle checks whether the
+                              relevant market is open before evaluating
+                              symbols.  If the callable returns ``False``,
+                              the evaluation cycle is skipped (the loop
+                              still sleeps normally so it stays alive).
+                              Pass ``None`` (default) to run 24/7 with no
+                              gating — appropriate for 24-hour markets
+                              such as crypto.
         """
         logger.info(
-            "HFT loop starting for symbols=%s interval=%.2fs risk=%s",
+            "HFT loop starting for symbols=%s interval=%.2fs risk=%s market_hours_fn=%s",
             symbols,
             self._risk.hft_interval,
             self._risk.name,
+            market_hours_fn.__name__ if market_hours_fn is not None else "None",
         )
 
         while True:
-            for symbol in symbols:
-                try:
-                    await self.evaluate_symbol(symbol, market_feed, news_feed)
-                except asyncio.CancelledError:
-                    logger.info("HFT loop cancelled during evaluate_symbol(%s)", symbol)
-                    raise
-                except Exception as exc:  # pylint: disable=broad-except
-                    # Log but keep the loop alive for other symbols / next cycle.
-                    logger.exception(
-                        "Unhandled error evaluating %s: %s", symbol, exc
-                    )
+            if market_hours_fn is not None and not market_hours_fn():
+                logger.debug("Market closed — skipping HFT cycle.")
+            else:
+                for symbol in symbols:
+                    try:
+                        await self.evaluate_symbol(symbol, market_feed, news_feed)
+                    except asyncio.CancelledError:
+                        logger.info("HFT loop cancelled during evaluate_symbol(%s)", symbol)
+                        raise
+                    except Exception as exc:  # pylint: disable=broad-except
+                        # Log but keep the loop alive for other symbols / next cycle.
+                        logger.exception(
+                            "Unhandled error evaluating %s: %s", symbol, exc
+                        )
 
             try:
                 await asyncio.sleep(self._risk.hft_interval)

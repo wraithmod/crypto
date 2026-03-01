@@ -16,10 +16,33 @@ import logging
 import time
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime, time as dtime
+import zoneinfo
 
 import yfinance as yf
 
 from config import config
+
+# ---------------------------------------------------------------------------
+# NYSE market-hours gate
+# ---------------------------------------------------------------------------
+
+_NYSE_TZ = zoneinfo.ZoneInfo("America/New_York")
+_NYSE_OPEN = dtime(9, 30)
+_NYSE_CLOSE = dtime(16, 0)
+
+
+def is_nyse_open() -> bool:
+    """Return True if NYSE is currently in its regular trading session.
+
+    NYSE regular hours are 09:30–16:00 Eastern Time, Monday–Friday.
+    No adjustment is made for US public holidays — callers should treat
+    holiday closures as edge cases where stale prices are already accepted.
+    """
+    now = datetime.now(_NYSE_TZ)
+    if now.weekday() >= 5:  # Saturday=5, Sunday=6
+        return False
+    return _NYSE_OPEN <= now.time() < _NYSE_CLOSE
 
 logger = logging.getLogger(__name__)
 

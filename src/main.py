@@ -17,7 +17,7 @@ from src.trading.risk import PROFILES
 from src.trading.strategy import STRATEGIES
 from src.agents.factory import create_provider
 from src.market.feed import MarketFeed
-from src.market.indices import IndicesFeed, ASXFeedAdapter
+from src.market.indices import IndicesFeed, ASXFeedAdapter, is_nyse_open
 from src.market.bybit_feed import BybitFeed
 from src.market.okx_feed import OKXFeed
 from src.market.deribit_feed import DeribitVolFeed
@@ -206,6 +206,8 @@ async def main(risk_profile=None, trade_groups: set | None = None, strategy=None
         logger.warning("--trade asx requested but config.asx_enabled=False — ASX HFT skipped.")
 
     # HFT loop for US stocks (yfinance 15-20 min delayed via IndicesFeed)
+    # Gated on NYSE market hours (09:30–16:00 ET, Mon–Fri) to avoid trading
+    # on stale previous-close prices that yfinance returns outside market hours.
     if "global" in trade_groups and config.us_stocks_enabled:
         us_adapter = ASXFeedAdapter(indices_feed)  # generic adapter — works for any IndicesFeed symbol
         tasks.append(asyncio.create_task(
@@ -213,11 +215,12 @@ async def main(risk_profile=None, trade_groups: set | None = None, strategy=None
                 symbols=config.us_stocks_symbols,
                 market_feed=us_adapter,
                 news_feed=news_feed,
+                market_hours_fn=is_nyse_open,
             ),
             name="hft_loop_us_stocks",
         ))
         logger.info(
-            "HFT loop active for %d US stocks (15-20 min delayed via yfinance).",
+            "HFT loop active for %d US stocks (NYSE hours only, 15-20 min delayed via yfinance).",
             len(config.us_stocks_symbols),
         )
     elif "global" in trade_groups and not config.us_stocks_enabled:
