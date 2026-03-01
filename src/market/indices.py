@@ -1,10 +1,11 @@
-"""Async poller for global financial market indices and ASX stocks via Yahoo Finance.
+"""Async poller for global financial market indices, US stocks, and ASX stocks via Yahoo Finance.
 
 Wraps the synchronous ``yfinance`` library in ``asyncio``'s thread-pool
 executor so the feed integrates cleanly with the rest of the async platform.
 
 Groups:
   global_markets — ^VIX, ^GSPC (S&P 500), ^IXIC, ^DJI, ^N225, ^GDAXI, ^FTSE, ^HSI
+  us_stocks      — AAPL, MSFT, NVDA … (top 20 US stocks, feature-flagged)
   asx_stocks     — CBA.AX, BHP.AX, CSL.AX … (top 50 ASX, feature-flagged)
 """
 
@@ -36,6 +37,14 @@ _INDEX_NAMES: dict[str, str] = {
     "^GDAXI": "DAX",
     "^FTSE":  "FTSE 100",
     "^HSI":   "Hang Seng",
+    # US stocks
+    "AAPL":  "Apple",       "MSFT":  "Microsoft",  "NVDA":  "NVIDIA",
+    "AMZN":  "Amazon",      "GOOGL": "Alphabet",   "META":  "Meta",
+    "TSLA":  "Tesla",       "BRK-B": "Berkshire",  "LLY":   "Eli Lilly",
+    "AVGO":  "Broadcom",    "JPM":   "JPMorgan",   "V":     "Visa",
+    "UNH":   "UnitedHlth",  "XOM":   "ExxonMobil", "COST":  "Costco",
+    "MA":    "Mastercard",  "WMT":   "Walmart",    "JNJ":   "J&J",
+    "PG":    "P&G",         "HD":    "Home Depot",
     # ASX stocks — stripped ticker is used as name (CBA.AX -> "CBA")
     # Overrides for clarity where needed:
     "CBA.AX":  "CBA",   "NAB.AX":  "NAB",   "WBC.AX":  "WBC",
@@ -62,9 +71,20 @@ _INDEX_NAMES: dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 def _group_for(symbol: str) -> str:
-    """Return the display group for a given symbol."""
+    """Return the display group for a given symbol.
+
+    Priority order:
+      1. Ends with ``.AX``           -> "asx_stocks"
+      2. Starts with ``^``           -> "global_markets"  (index symbol)
+      3. In config.us_stocks_symbols -> "us_stocks"
+      4. Fallback                    -> "global_markets"
+    """
     if symbol.endswith(".AX"):
         return "asx_stocks"
+    if symbol.startswith("^"):
+        return "global_markets"
+    if symbol in config.us_stocks_symbols:
+        return "us_stocks"
     return "global_markets"
 
 
@@ -81,7 +101,7 @@ class IndexTick:
     change: float     # Absolute day change  (price - previous_close)
     change_pct: float # Percentage day change
     timestamp: float  # Unix timestamp of fetch
-    group: str = "global_markets"  # "global_markets" | "asx_stocks"
+    group: str = "global_markets"  # "global_markets" | "us_stocks" | "asx_stocks"
 
 
 # ---------------------------------------------------------------------------
@@ -89,9 +109,10 @@ class IndexTick:
 # ---------------------------------------------------------------------------
 
 class IndicesFeed:
-    """Polls Yahoo Finance for global equity index and ASX stock data.
+    """Polls Yahoo Finance for global equity index, US stock, and ASX stock data.
 
-    Combines ``config.tracked_indices`` (always) with ``config.asx_symbols``
+    Combines ``config.tracked_indices`` (always) with ``config.us_stocks_symbols``
+    (when ``config.us_stocks_enabled`` is True) and ``config.asx_symbols``
     (when ``config.asx_enabled`` is True) into a single thread-pool fetch
     call per cycle.
 
@@ -100,6 +121,7 @@ class IndicesFeed:
         feed = IndicesFeed()
         asyncio.create_task(feed.start())
         tick = feed.get_latest("^GSPC")
+        us   = feed.get_by_group("us_stocks")
         asx  = feed.get_by_group("asx_stocks")
     """
 
@@ -110,6 +132,8 @@ class IndicesFeed:
     ) -> None:
         # Build combined symbol list
         base = symbols if symbols is not None else list(config.tracked_indices)
+        if config.us_stocks_enabled:
+            base = base + list(config.us_stocks_symbols)
         if config.asx_enabled:
             base = base + list(config.asx_symbols)
 
@@ -135,8 +159,9 @@ class IndicesFeed:
         """Fetch indices in a loop until :meth:`stop` is called."""
         self._running = True
         logger.info(
-            "IndicesFeed starting — %d global + %d ASX symbols (poll=%.0f s)",
+            "IndicesFeed starting — %d global + %d US + %d ASX symbols (poll=%.0f s)",
             len(config.tracked_indices),
+            len(config.us_stocks_symbols) if config.us_stocks_enabled else 0,
             len(config.asx_symbols) if config.asx_enabled else 0,
             self._poll_interval,
         )

@@ -3,8 +3,8 @@ Live console dashboard for the crypto trading platform.
 
 Renders a 3-region rich Layout that refreshes in-place without scrolling:
   - Header    : platform title and current timestamp
-  - Main row  : live crypto prices | portfolio holdings | P&L summary
-  - Markets   : global indices (left) | ASX stocks (right)
+  - Main row  : live crypto prices | portfolio holdings | P&L + US Stocks (right column)
+  - Markets   : global indices (full width)
 
 Expected dependency interfaces (injected at runtime):
 
@@ -223,9 +223,10 @@ class Dashboard:
         content.append(f"{_fmt_signed(realized)}\n", style=f"bold {r_color}")
         content.append("Unrealized:  ", style="dim")
         content.append(f"{_fmt_signed(unrealized)}\n", style=f"bold {u_color}")
-        content.append("─" * 22 + "\n", style="dim")
+        content.append("\n", style="")
+        content.append("─" * 28 + "\n", style="dim")
         content.append("Total P&L:   ", style="bold")
-        content.append(f"{_fmt_signed(total)}", style=f"bold {t_color}")
+        content.append(f"{_fmt_signed(total)}", style=f"bold underline {t_color}")
 
         return Panel(
             content,
@@ -307,6 +308,15 @@ class Dashboard:
                 ticks = get_by_group("asx_stocks")
         return self._make_index_table(ticks, title="ASX STOCKS", currency_symbol="A$")
 
+    def _make_us_stocks_table(self, indices_feed: Any) -> Table:
+        """Build the US STOCKS table (right column, below P&L)."""
+        ticks: dict[str, Any] = {}
+        if indices_feed is not None:
+            get_by_group = getattr(indices_feed, "get_by_group", None)
+            if get_by_group:
+                ticks = get_by_group("us_stocks")
+        return self._make_index_table(ticks, title="US STOCKS")
+
     # ------------------------------------------------------------------
     # Layout assembly
     # ------------------------------------------------------------------
@@ -335,9 +345,11 @@ class Dashboard:
         Assemble all panels into the 3-region Layout:
 
             ┌──────────────────────── header ─────────────────────────┐
-            │  crypto prices  │      portfolio       │      P&L        │
-            ├─────────────────── global markets ──────────────────────┤
-            └────────────────────── asx stocks ───────────────────────┘
+            │  crypto prices  │      portfolio       │   P&L           │
+            │                 │                      │─────────────────│
+            │                 │                      │   US STOCKS     │
+            ├─────────────────── global markets (full width) ─────────┤
+            └─────────────────────────────────────────────────────────┘
         """
         # Collect current prices once; reused by portfolio and P&L panels.
         symbols: list[str] = getattr(market_feed, "symbols", []) or []
@@ -347,15 +359,19 @@ class Dashboard:
             if tick is not None:
                 prices[sym] = float(tick.price)
 
+        # Determine whether US stocks data is available
+        has_us_stocks: bool = (
+            indices_feed is not None
+            and getattr(indices_feed, "get_by_group", None) is not None
+        )
+
         # Build panels
         prices_table = self._make_prices_table(market_feed)
         portfolio_table = self._make_portfolio_table(portfolio, prices)
         pnl_panel = self._make_pnl_panel(portfolio, prices)
         header_panel = self._make_header()
         markets_table = self._make_markets_table(indices_feed)
-        asx_table = self._make_asx_table(indices_feed) if (
-            indices_feed is not None and getattr(indices_feed, "get_by_group", None)
-        ) else None
+        us_stocks_table = self._make_us_stocks_table(indices_feed) if has_us_stocks else None
 
         # Update price history for direction arrows
         for sym, price in prices.items():
@@ -374,11 +390,11 @@ class Dashboard:
 
         layout["header"].update(header_panel)
 
-        # Main row: prices (narrow) | portfolio (wide) | pnl (narrow)
+        # Main row: prices (narrow) | portfolio (wide) | right_col (narrow)
         layout["main"].split_row(
             Layout(name="prices", ratio=2),
             Layout(name="portfolio", ratio=5),
-            Layout(name="pnl", ratio=2),
+            Layout(name="right_col", ratio=2),
         )
         layout["main"]["prices"].update(
             Panel(prices_table, border_style="blue", box=box.ROUNDED, padding=(0, 1))
@@ -386,24 +402,24 @@ class Dashboard:
         layout["main"]["portfolio"].update(
             Panel(portfolio_table, border_style="blue", box=box.ROUNDED, padding=(0, 1))
         )
-        layout["main"]["pnl"].update(pnl_panel)
 
-        # Markets row: Global Markets | ASX Stocks side by side when ASX enabled
-        if asx_table is not None:
-            layout["markets"].split_row(
-                Layout(name="global_markets", ratio=2),
-                Layout(name="asx_stocks", ratio=3),
+        # Right column: P&L on top, US Stocks below (when available)
+        if us_stocks_table is not None:
+            layout["main"]["right_col"].split_column(
+                Layout(name="pnl", ratio=2),
+                Layout(name="us_stocks", ratio=3),
             )
-            layout["markets"]["global_markets"].update(
-                Panel(markets_table, border_style="magenta", box=box.ROUNDED, padding=(0, 1))
-            )
-            layout["markets"]["asx_stocks"].update(
-                Panel(asx_table, border_style="yellow", box=box.ROUNDED, padding=(0, 1))
+            layout["main"]["right_col"]["pnl"].update(pnl_panel)
+            layout["main"]["right_col"]["us_stocks"].update(
+                Panel(us_stocks_table, border_style="green", box=box.ROUNDED, padding=(0, 1))
             )
         else:
-            layout["markets"].update(
-                Panel(markets_table, border_style="magenta", box=box.ROUNDED, padding=(0, 1))
-            )
+            layout["main"]["right_col"].update(pnl_panel)
+
+        # Markets row: Global Markets — full width
+        layout["markets"].update(
+            Panel(markets_table, border_style="magenta", box=box.ROUNDED, padding=(0, 1))
+        )
 
         return layout
 

@@ -81,6 +81,34 @@ class AppConfig:
     indices_poll_interval: float = 30.0
 
     # -----------------------------------------------------------------------
+    # US Stocks — top 20 US equities by market cap (Yahoo Finance symbols)
+    # -----------------------------------------------------------------------
+    us_stocks_enabled: bool = True
+
+    us_stocks_symbols: list[str] = field(default_factory=lambda: [
+        "AAPL",   # Apple
+        "MSFT",   # Microsoft
+        "NVDA",   # NVIDIA
+        "AMZN",   # Amazon
+        "GOOGL",  # Alphabet
+        "META",   # Meta
+        "TSLA",   # Tesla
+        "BRK-B",  # Berkshire Hathaway B
+        "LLY",    # Eli Lilly
+        "AVGO",   # Broadcom
+        "JPM",    # JPMorgan Chase
+        "V",      # Visa
+        "UNH",    # UnitedHealth
+        "XOM",    # ExxonMobil
+        "COST",   # Costco
+        "MA",     # Mastercard
+        "WMT",    # Walmart
+        "JNJ",    # Johnson & Johnson
+        "PG",     # Procter & Gamble
+        "HD",     # Home Depot
+    ])
+
+    # -----------------------------------------------------------------------
     # ASX (Australian Stock Exchange) — experimental feature flag
     # Set asx_enabled=False to disable the ASX panel entirely.
     # -----------------------------------------------------------------------
