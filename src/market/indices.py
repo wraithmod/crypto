@@ -42,9 +42,9 @@ _INDEX_NAMES: dict[str, str] = {
     "AMZN":  "Amazon",      "GOOGL": "Alphabet",   "META":  "Meta",
     "TSLA":  "Tesla",       "BRK-B": "Berkshire",  "LLY":   "Eli Lilly",
     "AVGO":  "Broadcom",    "JPM":   "JPMorgan",   "V":     "Visa",
-    "UNH":   "UnitedHlth",  "XOM":   "ExxonMobil", "COST":  "Costco",
+    "MU":    "Micron",       "XOM":   "ExxonMobil", "COST":  "Costco",
     "MA":    "Mastercard",  "WMT":   "Walmart",    "JNJ":   "J&J",
-    "PG":    "P&G",         "HD":    "Home Depot",
+    "ORCL":  "Oracle",      "ABBV":  "AbbVie",
     # ASX stocks — stripped ticker is used as name (CBA.AX -> "CBA")
     # Overrides for clarity where needed:
     "CBA.AX":  "CBA",   "NAB.AX":  "NAB",   "WBC.AX":  "WBC",

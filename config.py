@@ -98,14 +98,14 @@ class AppConfig:
         "AVGO",   # Broadcom
         "JPM",    # JPMorgan Chase
         "V",      # Visa
-        "UNH",    # UnitedHealth
+        "MU",     # Micron Technology
         "XOM",    # ExxonMobil
         "COST",   # Costco
         "MA",     # Mastercard
         "WMT",    # Walmart
         "JNJ",    # Johnson & Johnson
-        "PG",     # Procter & Gamble
-        "HD",     # Home Depot
+        "ORCL",   # Oracle
+        "ABBV",   # AbbVie
     ])
 
     # -----------------------------------------------------------------------
