@@ -174,3 +174,145 @@ class TestASXFeedAdapter:
         feed = _make_feed()
         adapter = ASXFeedAdapter(feed)
         assert adapter.get_latest("XYZ.AX") is None
+
+
+# ---------------------------------------------------------------------------
+# _group_for helper
+# ---------------------------------------------------------------------------
+
+class TestGroupFor:
+    """Unit tests for the _group_for(symbol) routing helper."""
+
+    def setup_method(self):
+        # Import here so it picks up the live config singleton
+        from src.market.indices import _group_for
+        self._group_for = _group_for
+
+    def test_aapl_is_us_stocks(self):
+        assert self._group_for("AAPL") == "us_stocks"
+
+    def test_nvda_is_us_stocks(self):
+        assert self._group_for("NVDA") == "us_stocks"
+
+    def test_brk_b_is_us_stocks(self):
+        """Hyphenated ticker BRK-B should map to us_stocks."""
+        assert self._group_for("BRK-B") == "us_stocks"
+
+    def test_vix_is_global_markets(self):
+        assert self._group_for("^VIX") == "global_markets"
+
+    def test_gspc_is_global_markets(self):
+        assert self._group_for("^GSPC") == "global_markets"
+
+    def test_cba_ax_is_asx_stocks(self):
+        assert self._group_for("CBA.AX") == "asx_stocks"
+
+    def test_bhp_ax_is_asx_stocks(self):
+        assert self._group_for("BHP.AX") == "asx_stocks"
+
+    def test_unknown_symbol_falls_back_to_global_markets(self):
+        """Symbols not in any known group fall back to global_markets."""
+        assert self._group_for("UNKNOWN_XYZ") == "global_markets"
+
+    def test_ax_suffix_takes_priority_over_us_stocks(self):
+        """A .AX symbol must be asx_stocks even if it happens to match a US ticker name."""
+        assert self._group_for("AAPL.AX") == "asx_stocks"
+
+    def test_caret_prefix_takes_priority_over_us_stocks(self):
+        """^-prefixed symbols must be global_markets regardless of name."""
+        assert self._group_for("^AAPL") == "global_markets"
+
+
+# ---------------------------------------------------------------------------
+# IndicesFeed with us_stocks_enabled=True
+# ---------------------------------------------------------------------------
+
+class TestIndicesFeedUSStocks:
+    """Tests for IndicesFeed behaviour when US stocks are enabled."""
+
+    def _make_us_feed(self) -> IndicesFeed:
+        """Construct an IndicesFeed that includes US stock symbols without network access."""
+        from collections import deque
+        from config import config, AppConfig
+        # Build a minimal config-like list for testing
+        us_syms = list(config.us_stocks_symbols)
+        global_syms = ["^GSPC"]
+        all_syms = global_syms + us_syms
+
+        feed = IndicesFeed.__new__(IndicesFeed)
+        feed._symbols = all_syms
+        feed._poll_interval = 30.0
+        feed._latest = {}
+        feed._price_history = {sym: deque(maxlen=config.price_history_len) for sym in all_syms}
+        feed._running = False
+        return feed, us_syms
+
+    def test_us_stocks_present_in_symbol_list(self):
+        feed, us_syms = self._make_us_feed()
+        for sym in us_syms:
+            assert sym in feed._symbols, f"{sym} should be in feed._symbols"
+
+    def test_aapl_in_symbol_list(self):
+        feed, _ = self._make_us_feed()
+        assert "AAPL" in feed._symbols
+
+    def test_nvda_in_symbol_list(self):
+        feed, _ = self._make_us_feed()
+        assert "NVDA" in feed._symbols
+
+    def test_brk_b_in_symbol_list(self):
+        feed, _ = self._make_us_feed()
+        assert "BRK-B" in feed._symbols
+
+    def test_get_by_group_us_stocks_empty_on_fresh_init(self):
+        """get_by_group('us_stocks') returns {} when no data has been fetched yet."""
+        feed, _ = self._make_us_feed()
+        result = feed.get_by_group("us_stocks")
+        assert result == {}
+
+    def test_get_by_group_us_stocks_returns_injected_tick(self):
+        """After injecting a US stock tick, get_by_group('us_stocks') must return it."""
+        feed, _ = self._make_us_feed()
+        tick = IndexTick(
+            symbol="AAPL",
+            name="Apple",
+            price=175.0,
+            change=1.5,
+            change_pct=0.86,
+            timestamp=time.time(),
+            group="us_stocks",
+        )
+        feed._latest["AAPL"] = tick
+        result = feed.get_by_group("us_stocks")
+        assert "AAPL" in result
+        assert result["AAPL"].price == pytest.approx(175.0)
+
+    def test_get_by_group_us_stocks_excludes_global_indices(self):
+        """global_markets ticks must not appear in the us_stocks group."""
+        feed, _ = self._make_us_feed()
+        # Inject a global index tick
+        gspc_tick = IndexTick(
+            symbol="^GSPC",
+            name="S&P 500",
+            price=5000.0,
+            change=10.0,
+            change_pct=0.2,
+            timestamp=time.time(),
+            group="global_markets",
+        )
+        feed._latest["^GSPC"] = gspc_tick
+        result = feed.get_by_group("us_stocks")
+        assert "^GSPC" not in result
+
+    def test_price_history_initialised_for_us_stocks(self):
+        """Price history deques should exist for all US stock symbols on init."""
+        feed, us_syms = self._make_us_feed()
+        for sym in us_syms:
+            assert sym in feed._price_history
+
+    def test_price_history_accumulates_for_us_stock(self):
+        """Injecting prices into _price_history deque reflects in get_price_history."""
+        feed, _ = self._make_us_feed()
+        feed._price_history["NVDA"].append(500.0)
+        feed._price_history["NVDA"].append(505.0)
+        assert feed.get_price_history("NVDA") == pytest.approx([500.0, 505.0])
