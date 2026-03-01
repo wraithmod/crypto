@@ -98,11 +98,11 @@ async def main(risk_profile=None, trade_groups: set | None = None, strategy=None
     if strategy is None:
         strategy = STRATEGIES["classic"]
 
-    # Resolve trade groups — "all" expands to crypto + asx
+    # Resolve trade groups — "all" expands to crypto + asx + global
     if trade_groups is None:
         trade_groups = {"crypto"}
     if "all" in trade_groups:
-        trade_groups = {"crypto", "asx"}
+        trade_groups = {"crypto", "asx", "global"}
 
     # Resolve extra feeds — default to binance only
     if feeds is None:
@@ -125,8 +125,8 @@ async def main(risk_profile=None, trade_groups: set | None = None, strategy=None
     )
     if "global" in trade_groups:
         logger.info(
-            "Note: 'global' indices (%s) are display-only — index futures cannot be paper-traded.",
-            [s for s in config.tracked_indices],
+            "'global' group: will actively paper-trade %d US stocks via yfinance (15-20 min delayed).",
+            len(config.us_stocks_symbols),
         )
 
     # ------------------------------------------------------------------
@@ -204,6 +204,24 @@ async def main(risk_profile=None, trade_groups: set | None = None, strategy=None
         )
     elif "asx" in trade_groups and not config.asx_enabled:
         logger.warning("--trade asx requested but config.asx_enabled=False — ASX HFT skipped.")
+
+    # HFT loop for US stocks (yfinance 15-20 min delayed via IndicesFeed)
+    if "global" in trade_groups and config.us_stocks_enabled:
+        us_adapter = ASXFeedAdapter(indices_feed)  # generic adapter — works for any IndicesFeed symbol
+        tasks.append(asyncio.create_task(
+            engine.run_hft_loop(
+                symbols=config.us_stocks_symbols,
+                market_feed=us_adapter,
+                news_feed=news_feed,
+            ),
+            name="hft_loop_us_stocks",
+        ))
+        logger.info(
+            "HFT loop active for %d US stocks (15-20 min delayed via yfinance).",
+            len(config.us_stocks_symbols),
+        )
+    elif "global" in trade_groups and not config.us_stocks_enabled:
+        logger.warning("--trade global requested but config.us_stocks_enabled=False — US stocks HFT skipped.")
 
     # ------------------------------------------------------------------
     # Extra exchange feeds (Bybit, OKX, Deribit) — controlled by --feeds
@@ -317,7 +335,7 @@ if __name__ == "__main__":
         help=(
             "Which groups to actively trade (one or more): "
             "crypto | asx | global | all  "
-            "(global is display-only — indices can't be paper-traded; default: crypto)"
+            "(global = top-20 US stocks via yfinance [15-20 min delayed]; default: crypto)"
         ),
     )
     parser.add_argument(
