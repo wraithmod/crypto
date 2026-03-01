@@ -49,6 +49,35 @@ class Indicators:
     donchian_low: float | None = None    # 20-period low  excl. current bar
     atr: float | None = None             # ATR 14-period  (requires candle OHLC)
 
+    # Mean reversion indicators
+    cci: float | None = None               # CCI 20-period
+    keltner_upper: float | None = None     # EMA20 + 2*ATR (ta.volatility.KeltnerChannel)
+    keltner_mid: float | None = None       # EMA20 midline
+    keltner_lower: float | None = None     # EMA20 - 2*ATR
+    williams_r: float | None = None        # Williams %R 14-period [-100, 0]
+    price_zscore: float | None = None      # (price - rolling_mean_20) / rolling_std_20
+
+    # Volume flow indicators
+    mfi: float | None = None               # MFI 14-period [0-100]
+    obv: float | None = None               # On-Balance Volume
+    obv_ema: float | None = None           # EMA(14) of OBV
+    obv_rising: bool | None = None         # OBV > obv_ema
+    cmf: float | None = None               # Chaikin Money Flow [-1, +1]
+    vwap_std: float | None = None          # Rolling std of (price - vwap) residuals
+    vwap_upper1: float | None = None       # vwap + 1*vwap_std
+    vwap_upper2: float | None = None       # vwap + 2*vwap_std
+    vwap_lower1: float | None = None       # vwap - 1*vwap_std
+    vwap_lower2: float | None = None       # vwap - 2*vwap_std
+
+    # Advanced trend/regime indicators
+    supertrend: float | None = None        # SuperTrend line value
+    supertrend_bullish: bool | None = None # price > supertrend line
+    rsi_fast: float | None = None          # RSI 7-period
+    rsi_slow: float | None = None          # RSI 21-period
+    bb_width: float | None = None          # (bb_upper - bb_lower) / bb_mid
+    bb_width_percentile: float | None = None  # percentile of bb_width in 50-bar history
+    squeeze_active: bool | None = None     # bb_width_percentile < 0.20
+
     # ---------------------------------------------------------------------------
     # Classic indicator properties (unchanged)
     # ---------------------------------------------------------------------------
@@ -275,6 +304,18 @@ class Predictor:
             logger.debug("ATR computation failed: %s", exc)
             return None
 
+    @staticmethod
+    def _safe_float(val) -> float | None:
+        """Return float or None if NaN/None."""
+        import math
+        if val is None:
+            return None
+        try:
+            f = float(val)
+            return None if math.isnan(f) else f
+        except (TypeError, ValueError):
+            return None
+
     # ---------------------------------------------------------------------------
     # Main indicator computation
     # ---------------------------------------------------------------------------
@@ -385,6 +426,163 @@ class Predictor:
             atr_val = self._compute_atr(candles)
             if atr_val is not None:
                 ind.atr = atr_val
+
+        # Build a candle-close series once for reuse in blocks below
+        series_candles: pd.Series | None = None
+        if candles:
+            series_candles = pd.Series([c.close for c in candles], dtype=float)
+
+        # --- CCI ---
+        try:
+            cci_ind = ta.trend.CCIIndicator(
+                high=pd.Series([c.high for c in candles], dtype=float) if candles else series,
+                low=pd.Series([c.low for c in candles], dtype=float) if candles else series,
+                close=series_candles if candles else series,
+                window=20,
+            )
+            val = cci_ind.cci().iloc[-1]
+            if not pd.isna(val):
+                ind.cci = float(val)
+        except Exception:
+            pass
+
+        # --- Keltner Channels (requires candles for high/low) ---
+        if candles and len(candles) >= 20 and series_candles is not None:
+            try:
+                kc = ta.volatility.KeltnerChannel(
+                    high=pd.Series([c.high for c in candles], dtype=float),
+                    low=pd.Series([c.low for c in candles], dtype=float),
+                    close=series_candles,
+                    window=20, window_atr=10,
+                )
+                ind.keltner_upper = self._safe_float(kc.keltner_channel_hband().iloc[-1])
+                ind.keltner_mid   = self._safe_float(kc.keltner_channel_mband().iloc[-1])
+                ind.keltner_lower = self._safe_float(kc.keltner_channel_lband().iloc[-1])
+            except Exception:
+                pass
+
+        # --- Williams %R ---
+        if candles and len(candles) >= 14 and series_candles is not None:
+            try:
+                wr = ta.momentum.WilliamsRIndicator(
+                    high=pd.Series([c.high for c in candles], dtype=float),
+                    low=pd.Series([c.low for c in candles], dtype=float),
+                    close=series_candles, lbp=14,
+                )
+                ind.williams_r = self._safe_float(wr.williams_r().iloc[-1])
+            except Exception:
+                pass
+
+        # --- Z-Score (pure numpy, requires 20+ price bars) ---
+        if len(prices) >= 20:
+            window_prices = prices[-20:]
+            mean_p = float(np.mean(window_prices))
+            std_p  = float(np.std(window_prices))
+            if std_p > 0:
+                ind.price_zscore = (prices[-1] - mean_p) / std_p
+
+        # --- MFI (requires candles with volume) ---
+        if candles and len(candles) >= 14 and series_candles is not None:
+            try:
+                mfi = ta.volume.MFIIndicator(
+                    high=pd.Series([c.high for c in candles], dtype=float),
+                    low=pd.Series([c.low for c in candles], dtype=float),
+                    close=series_candles,
+                    volume=pd.Series([c.volume for c in candles], dtype=float),
+                    window=14,
+                )
+                ind.mfi = self._safe_float(mfi.money_flow_index().iloc[-1])
+            except Exception:
+                pass
+
+        # --- OBV ---
+        if candles and len(candles) >= 2 and series_candles is not None:
+            try:
+                obv_ind = ta.volume.OnBalanceVolumeIndicator(
+                    close=series_candles,
+                    volume=pd.Series([c.volume for c in candles], dtype=float),
+                )
+                obv_series = obv_ind.on_balance_volume()
+                ind.obv = self._safe_float(obv_series.iloc[-1])
+                if len(obv_series) >= 14:
+                    obv_ema_series = obv_series.ewm(span=14, adjust=False).mean()
+                    ind.obv_ema = self._safe_float(obv_ema_series.iloc[-1])
+                    if ind.obv is not None and ind.obv_ema is not None:
+                        ind.obv_rising = ind.obv > ind.obv_ema
+            except Exception:
+                pass
+
+        # --- CMF ---
+        if candles and len(candles) >= 20 and series_candles is not None:
+            try:
+                cmf = ta.volume.ChaikinMoneyFlowIndicator(
+                    high=pd.Series([c.high for c in candles], dtype=float),
+                    low=pd.Series([c.low for c in candles], dtype=float),
+                    close=series_candles,
+                    volume=pd.Series([c.volume for c in candles], dtype=float),
+                    window=20,
+                )
+                ind.cmf = self._safe_float(cmf.chaikin_money_flow().iloc[-1])
+            except Exception:
+                pass
+
+        # --- VWAP Bands (std dev bands around VWAP) ---
+        if ind.vwap is not None and candles and len(candles) >= 20:
+            try:
+                residuals = [c.typical_price - ind.vwap for c in candles[-20:]]
+                std_val = float(np.std(residuals))
+                if std_val > 0:
+                    ind.vwap_std    = std_val
+                    ind.vwap_upper1 = ind.vwap + 1.0 * std_val
+                    ind.vwap_upper2 = ind.vwap + 2.0 * std_val
+                    ind.vwap_lower1 = ind.vwap - 1.0 * std_val
+                    ind.vwap_lower2 = ind.vwap - 2.0 * std_val
+            except Exception:
+                pass
+
+        # --- SuperTrend (ATR-based, period=7, multiplier=3.0) ---
+        if candles and len(candles) >= 14 and ind.atr is not None:
+            try:
+                multiplier = 3.0
+                last = candles[-1]
+                basic_upper = last.typical_price + multiplier * ind.atr
+                basic_lower = last.typical_price - multiplier * ind.atr
+                st_bullish = prices[-1] > basic_lower
+                ind.supertrend = basic_lower if st_bullish else basic_upper
+                ind.supertrend_bullish = st_bullish
+            except Exception:
+                pass
+
+        # --- Dual RSI ---
+        if len(prices) >= 21:
+            try:
+                ind.rsi_fast = self._safe_float(
+                    ta.momentum.RSIIndicator(close=series, window=7).rsi().iloc[-1]
+                )
+                ind.rsi_slow = self._safe_float(
+                    ta.momentum.RSIIndicator(close=series, window=21).rsi().iloc[-1]
+                )
+            except Exception:
+                pass
+
+        # --- BB Width + Squeeze ---
+        try:
+            bb_w = (ind.bb_upper - ind.bb_lower) / ind.bb_mid if ind.bb_mid != 0 else None
+            if bb_w is not None:
+                ind.bb_width = bb_w
+                if len(prices) >= 50:
+                    closes_50 = prices[-50:]
+                    ser50 = pd.Series(closes_50, dtype=float)
+                    roll_std = ser50.rolling(20).std()
+                    roll_mid = ser50.rolling(20).mean()
+                    widths = ((roll_mid + 2 * roll_std) - (roll_mid - 2 * roll_std)) / roll_mid
+                    valid = widths.dropna()
+                    if len(valid) > 0:
+                        pct = float((valid < bb_w).mean())
+                        ind.bb_width_percentile = pct
+                        ind.squeeze_active = pct < 0.20
+        except Exception:
+            pass
 
         return ind
 

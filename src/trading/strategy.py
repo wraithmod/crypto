@@ -556,4 +556,13 @@ STRATEGIES: dict[str, TradingStrategy] = {
     "sentiment": SentimentStrategy(),
 }
 
+# Merge extended strategy sub-packages
+from src.trading.strategies.mean_reversion import MEAN_REVERSION_STRATEGIES  # noqa: E402
+from src.trading.strategies.volume_flow import VOLUME_FLOW_STRATEGIES        # noqa: E402
+from src.trading.strategies.advanced import ADVANCED_STRATEGIES              # noqa: E402
+
+STRATEGIES.update(MEAN_REVERSION_STRATEGIES)
+STRATEGIES.update(VOLUME_FLOW_STRATEGIES)
+STRATEGIES.update(ADVANCED_STRATEGIES)
+
 DEFAULT_STRATEGY: TradingStrategy = STRATEGIES["classic"]

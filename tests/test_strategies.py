@@ -65,7 +65,11 @@ def _make_ind(
 
 class TestStrategiesRegistry:
     def test_has_exactly_five_keys(self):
-        assert set(STRATEGIES.keys()) == {"classic", "trend", "breakout", "scalp", "sentiment"}
+        # Registry now contains the original 5 strategies plus 11 extended strategies (16 total).
+        # All original strategies must still be present.
+        original_five = {"classic", "trend", "breakout", "scalp", "sentiment"}
+        assert original_five.issubset(set(STRATEGIES.keys()))
+        assert len(STRATEGIES) == 16
 
     def test_all_values_are_trading_strategy_instances(self):
         for name, strat in STRATEGIES.items():
