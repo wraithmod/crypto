@@ -1,5 +1,12 @@
 # GEMINI Sub-Agent
 
+## Headless Invocation
+Run headless via: `gemini -p "prompt" -m gemini-2.5-pro --yolo`
+- `-p` = non-interactive/headless mode
+- `-m gemini-2.5-pro` = use Pro model (paid plan, higher rate limits than flash-lite free tier)
+- `--yolo` = auto-approve all tool actions
+- Credentials cached locally — no additional auth needed
+
 ## Role
 Market research, news source discovery, financial data analysis, and sentiment system design for the crypto trading platform at `/home/wraith/making`.
 
